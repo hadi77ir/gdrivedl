@@ -10,29 +10,34 @@ We have already known that the shared files on Google Drive can be downloaded wi
 
 - Can download all shared files except for project files.
 
-- By using API key, goodls can download all files in a shared folder.
+- gdrivedl can download all files in a public shared folder without an API key.
 
-- By using API key, goodls can run the resumable download of files.
+- By using API key, gdrivedl can run the resumable download of files.
 
 ---------------------------------------------------------------
 
 # How to Install
-Download an executable file of goodls from https://github.com/tanaikech/goodls/releases
+Download an executable file of gdrivedl from https://github.com/hadi77ir/gdrivedl/releases
 
 or
 
-Use go get.
+Use go install.
 
-$ go get -u github.com/tanaikech/goodls
+$ go install github.com/hadi77ir/gdrivedl@latest
 
 # Usage
-You can use this just after you download or install goodls. You are not required to do like OAuth2 process.
+You can use this just after you download or install gdrivedl. You are not required to do like OAuth2 process.
 
-$ goodls -u [URL of shared file on Google Drive]
+$ gdrivedl -u [URL of shared file on Google Drive]
 
-If you use API key, you can download all files in a shared folder.
+You can download all files in a public shared folder without an API key.
 
-$ goodls -u [URL of shared folder on Google Drive] -key [API key]
+$ gdrivedl -u [URL of shared folder on Google Drive]
 
----------------------------------------------------------------*/
+If you use API key, you can also use the Drive API based folder flow.
+
+$ gdrivedl -u [URL of shared folder on Google Drive] -key [API key]
+
+---------------------------------------------------------------
+*/
 package main

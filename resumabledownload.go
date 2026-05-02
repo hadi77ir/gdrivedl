@@ -21,7 +21,6 @@ import (
 
 	drive "google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
-	"google.golang.org/api/option"
 )
 
 // valResumableDownload : Structure for resumable download
@@ -45,7 +44,11 @@ func (p *para) getFileInfFromP() (*drive.File, error) {
 	v := &valResumableDownload{
 		para: *p,
 	}
-	v.Client = &http.Client{}
+	var err error
+	v.Client, err = v.TransportConfig.newHTTPClient(nil)
+	if err != nil {
+		return nil, err
+	}
 	if err := v.getFileInf(); err != nil {
 		return nil, err
 	}
@@ -126,12 +129,15 @@ func (v *valResumableDownload) resDownloadFileByAPIKey() (*http.Response, error)
 		}
 		return 0
 	}(v.DownloadFile.Size)
-	v.Client.Timeout = time.Duration(timeOut) * time.Second
+	if v.Client.Timeout == 0 {
+		v.Client.Timeout = time.Duration(timeOut) * time.Second
+	}
 	req, err := http.NewRequest("get", u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Range", v.Range)
+	req = v.traceRequest(req)
 	res, err := v.Client.Do(req)
 	if err != nil {
 		return nil, err
@@ -149,7 +155,7 @@ func (v *valResumableDownload) resDownloadFileByAPIKey() (*http.Response, error)
 
 // getFileInf : Retrieve file infomation using Drive API.
 func (v *valResumableDownload) getFileInf() error {
-	srv, err := drive.NewService(context.Background(), option.WithAPIKey(v.para.APIKey))
+	srv, err := v.newDriveService(context.Background())
 	if err != nil {
 		return err
 	}
@@ -198,6 +204,41 @@ func (v *valResumableDownload) chkResumeFile() (bool, bool, error) {
 	v.Range = fmt.Sprintf("bytes=%d-%d", v.Start, v.End)
 	v.Size = v.End - v.Start + 1
 	return true, false, nil
+}
+
+func (p *para) newResumableDownloadState() (*valResumableDownload, bool, bool, error) {
+	downloadBytes, err := getDownloadBytes(p.Resumabledownload)
+	if err != nil {
+		return nil, false, false, err
+	}
+	v := &valResumableDownload{
+		para: *p,
+	}
+	v.DownloadBytes = downloadBytes
+	if err := v.getFileInf(); err != nil {
+		return nil, false, false, err
+	}
+	if strings.Contains(v.DownloadFile.MimeType, "application/vnd.google-apps") {
+		return nil, false, false, fmt.Errorf("a Google Docs file cannot be resumable downloaded")
+	}
+	fc, end, err := v.chkResumeFile()
+	if err != nil {
+		return nil, false, false, err
+	}
+	p.Filename = v.Filename
+	p.Size = v.DownloadFile.Size
+	p.DownloadBytes = downloadBytes
+	if p.Task != nil {
+		p.Task.SetName(v.Filename)
+		p.Task.SetTotal(v.DownloadFile.Size)
+		p.Task.SetDownloaded(v.CurrentFileSize)
+	}
+	return v, fc, end, nil
+}
+
+func (p *para) precheckResumableDownload() (bool, bool, error) {
+	_, fc, end, err := p.newResumableDownloadState()
+	return fc, end, err
 }
 
 // setIndent : Set indent of each element using the maximum length of element.
@@ -294,24 +335,24 @@ func (v *valResumableDownload) getStatusMsg(fc, end bool) string {
 
 // resumableDownload : Main method of resumable download.
 func (p *para) resumableDownload() error {
-	v := &valResumableDownload{
-		para: *p,
+	if p.DryRun {
+		return p.resumableDryRun()
 	}
-	if err := v.getFileInf(); err != nil {
-		return err
-	}
-	if strings.Contains(v.DownloadFile.MimeType, "application/vnd.google-apps") {
-		return fmt.Errorf("a Google Docs file cannot be resumable downloaded")
-	}
-	fc, end, err := v.chkResumeFile()
+	v, fc, end, err := p.newResumableDownloadState()
 	if err != nil {
 		return err
 	}
+	if v.Client == nil {
+		v.Client, err = v.TransportConfig.newHTTPClient(nil)
+		if err != nil {
+			return err
+		}
+	}
 	msg := v.getStatusMsg(fc, end)
 	if (!fc && !end) || (fc && !end) {
-		fmt.Printf("\n%s\n\n", msg)
+		p.printf("\n%s\n\n", msg)
 		var input string
-		fmt.Printf("Do you start this download? [y or n] ... ")
+		p.printf("Do you start this download? [y or n] ... ")
 		if _, err := fmt.Scan(&input); err != nil {
 			return err
 		}
@@ -322,8 +363,59 @@ func (p *para) resumableDownload() error {
 			}
 			return v.para.saveFile(res)
 		}
+		if p.Task != nil {
+			p.Task.MarkSkipped("cancelled")
+		}
 	} else {
-		fmt.Printf("\n%s\n", msg)
+		p.printf("\n%s\n", msg)
+		if p.Task != nil {
+			p.Task.SetTotal(v.DownloadFile.Size)
+			p.Task.SetDownloaded(v.DownloadFile.Size)
+			p.Task.MarkCompleted()
+		}
 	}
 	return nil
+}
+
+func (p *para) resumableDryRun() error {
+	downloadBytes, err := getDownloadBytes(p.Resumabledownload)
+	if err != nil {
+		return err
+	}
+	v := &valResumableDownload{para: *p}
+	v.DownloadBytes = downloadBytes
+	if err := v.getFileInf(); err != nil {
+		return err
+	}
+	if strings.Contains(v.DownloadFile.MimeType, "application/vnd.google-apps") {
+		return fmt.Errorf("a Google Docs file cannot be resumable downloaded")
+	}
+	if v.Filename == "" {
+		v.Filename = v.DownloadFile.Name
+	}
+	if v.DownloadFile.Size > 0 {
+		end := downloadBytes - 1
+		if end >= v.DownloadFile.Size {
+			end = v.DownloadFile.Size - 1
+		}
+		v.Range = fmt.Sprintf("bytes=0-%d", end)
+		v.Size = v.DownloadFile.Size
+	} else {
+		v.Range = fmt.Sprintf("bytes=0-%d", downloadBytes-1)
+	}
+	v.para.Filename = v.Filename
+	v.para.Size = v.DownloadFile.Size
+	if v.Task != nil {
+		v.Task.SetName(v.Filename)
+		v.Task.SetTotal(v.DownloadFile.Size)
+	}
+	v.Client, err = v.TransportConfig.newHTTPClient(nil)
+	if err != nil {
+		return err
+	}
+	res, err := v.resDownloadFileByAPIKey()
+	if err != nil {
+		return err
+	}
+	return v.para.completeDryRun(res)
 }
