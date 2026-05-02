@@ -10,6 +10,9 @@ out/
 # Golang #
 ##########
 
+## GoReleaser
+dist/
+
 .gocache/
 .gomodcache/
 
