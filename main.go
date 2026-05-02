@@ -1,10 +1,11 @@
 // Package main (goodls.go) :
 // These methods are for downloading shared files from Google Drive.
-package main
+package gdrivedl
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +70,7 @@ type para struct {
 	Task                  *downloadTask
 	TransportConfig       transportConfig
 	URL                   string
+	Context               context.Context
 	WorkDir               string
 	URLForLargeFile       string
 }
@@ -94,6 +96,13 @@ func (p *para) printf(format string, args ...interface{}) {
 	fmt.Printf(format, args...)
 }
 
+func (p *para) statusf(format string, args ...interface{}) {
+	if p == nil {
+		return
+	}
+	p.printf("[status] "+format+"\n", args...)
+}
+
 func (p *para) traceRequest(req *http.Request) *http.Request {
 	return withRequestTrace(req, p.Runtime, p.Task)
 }
@@ -111,7 +120,7 @@ func (p *para) getURLFromHTML(res *http.Response) error {
 		return fmt.Errorf("Specification of the endpoint for downloading the file might have been changed.")
 	}
 	url := htmlAttr(form, "action")
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(p.requestContext(), "GET", url, nil)
 	if err != nil {
 		return err
 	}
@@ -385,7 +394,7 @@ func (p *para) downloadLargeFile() error {
 
 // fetch : Fetch data from Google Drive
 func (p *para) fetch(url string) (*http.Response, error) {
-	req, err := http.NewRequest("get", url, nil)
+	req, err := http.NewRequestWithContext(p.requestContext(), "get", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -637,25 +646,43 @@ func downloadURLList(p *para, urls []string) error {
 		workers = 1
 	}
 	jobs := make(chan string)
+	ctx := p.requestContext()
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for rawURL := range jobs {
-				jobPara := p.clone()
-				jobPara.Filename = ""
-				if err := jobPara.download(rawURL); err != nil {
-					jobPara.printf("## Skipped: Error: %v\n", err)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case rawURL, ok := <-jobs:
+					if !ok {
+						return
+					}
+					jobPara := p.clone()
+					jobPara.Filename = ""
+					if err := jobPara.download(rawURL); err != nil {
+						jobPara.printf("## Skipped: Error: %v\n", err)
+					}
 				}
 			}
 		}()
 	}
 	for _, rawURL := range urls {
-		jobs <- rawURL
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
+		case jobs <- rawURL:
+		}
 	}
 	close(jobs)
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -697,7 +724,7 @@ func createHelp() *cli.App {
 		{Name: "hadi77ir [ https://github.com/hadi77ir/gdrivedl ] "},
 	}
 	a.UsageText = "Download shared files on Google Drive."
-	a.Version = "2.0.6"
+	a.Version = Version
 	a.Flags = []cli.Flag{
 		&cli.StringFlag{
 			Name:  "url, u",
@@ -838,13 +865,8 @@ func createHelp() *cli.App {
 	return a
 }
 
-// main : Main of this script
-func main() {
+func RunCLI(args []string) error {
 	a := createHelp()
 	a.Action = handler
-	err := a.Run(os.Args)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	return a.Run(args)
 }

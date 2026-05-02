@@ -1,0 +1,14 @@
+version: 2
+
+builds:
+  - id: gdrivedl
+    main: ./cmd/gdrivedl
+    binary: gdrivedl
+
+archives:
+  - id: default
+    builds:
+      - gdrivedl
+
+changelog:
+  use: git

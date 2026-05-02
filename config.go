@@ -1,4 +1,4 @@
-package main
+package gdrivedl
 
 import (
 	"bufio"
@@ -920,9 +920,11 @@ func (p *para) newHTTPClient(jar *cookiejar.Jar) (*http.Client, error) {
 }
 
 func (p *para) newDriveService(ctx context.Context) (*drive.Service, error) {
+	p.statusf("Initializing Google Drive API client")
 	client, err := p.TransportConfig.newGoogleAPIClient(ctx, p.APIKey)
 	if err != nil {
 		return nil, err
 	}
+	p.statusf("Creating Google Drive service")
 	return drive.NewService(ctx, option.WithHTTPClient(client))
 }

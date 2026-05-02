@@ -1,4 +1,4 @@
-package main
+package gdrivedl
 
 import (
 	"io"
@@ -390,6 +390,10 @@ func TestFolderHelperFunctions(t *testing.T) {
 	if err := p.makeDirByCondition(newDir); err != nil {
 		t.Fatalf("makeDirByCondition() error = %v", err)
 	}
+	nestedDir := filepath.Join(dir, "parent", "child", "grandchild")
+	if err := p.makeDirByCondition(nestedDir); err != nil {
+		t.Fatalf("makeDirByCondition(nested) error = %v", err)
+	}
 
 	dryRunDir := filepath.Join(dir, "dry-run-child")
 	if err := (&para{DryRun: true}).makeDirByCondition(dryRunDir); err != nil {
@@ -400,5 +404,8 @@ func TestFolderHelperFunctions(t *testing.T) {
 	}
 	if !chkFile(newDir) {
 		t.Fatalf("directory %q was not created", newDir)
+	}
+	if !chkFile(nestedDir) {
+		t.Fatalf("nested directory %q was not created", nestedDir)
 	}
 }

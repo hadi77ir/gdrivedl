@@ -1,4 +1,4 @@
-package main
+package gdrivedl
 
 import (
 	"fmt"
@@ -22,6 +22,7 @@ type downloadRuntime struct {
 	showProgress bool
 	exitReport   bool
 	startedAt    time.Time
+	observer     func(ProgressSnapshot)
 
 	mu          sync.RWMutex
 	tasks       []*downloadTask
@@ -68,11 +69,16 @@ type taskSnapshot struct {
 }
 
 func newDownloadRuntime(showProgress, exitReport bool) *downloadRuntime {
+	return newObservedDownloadRuntime(showProgress, exitReport, nil)
+}
+
+func newObservedDownloadRuntime(showProgress, exitReport bool, observer func(ProgressSnapshot)) *downloadRuntime {
 	now := time.Now()
 	return &downloadRuntime{
 		showProgress: showProgress,
 		exitReport:   exitReport,
 		startedAt:    now,
+		observer:     observer,
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
 		lastTick:     now,
@@ -80,7 +86,7 @@ func newDownloadRuntime(showProgress, exitReport bool) *downloadRuntime {
 }
 
 func (r *downloadRuntime) start() {
-	if r == nil || !r.showProgress {
+	if r == nil || (!r.showProgress && r.observer == nil) {
 		return
 	}
 	go r.renderLoop()
@@ -90,10 +96,11 @@ func (r *downloadRuntime) finish() {
 	if r == nil {
 		return
 	}
-	if r.showProgress {
+	if r.showProgress || r.observer != nil {
 		close(r.stopCh)
 		<-r.doneCh
 	}
+	r.emitProgress()
 	if r.exitReport {
 		r.printExitReport()
 	}
@@ -107,6 +114,7 @@ func (r *downloadRuntime) renderLoop() {
 		select {
 		case <-ticker.C:
 			r.renderProgress()
+			r.emitProgress()
 		case <-r.stopCh:
 			r.clearProgressLine()
 			return
@@ -131,7 +139,42 @@ func (r *downloadRuntime) newTask(name, source string) *downloadTask {
 	r.mu.Lock()
 	r.tasks = append(r.tasks, task)
 	r.mu.Unlock()
+	r.emitProgress()
 	return task
+}
+
+func (r *downloadRuntime) emitProgress() {
+	if r == nil || r.observer == nil {
+		return
+	}
+	r.observer(r.progressSnapshot())
+}
+
+func (r *downloadRuntime) progressSnapshot() ProgressSnapshot {
+	tasks := r.snapshotTasks()
+	snapshot := ProgressSnapshot{Tasks: make([]TaskSnapshot, 0, len(tasks))}
+	for _, task := range tasks {
+		snapshot.Tasks = append(snapshot.Tasks, TaskSnapshot{
+			Name:       task.Name,
+			Source:     task.Source,
+			State:      task.State,
+			Status:     string(task.Status),
+			Detail:     task.Detail,
+			Total:      task.Total,
+			Downloaded: task.Downloaded,
+			UpdatedAt:  task.UpdatedAt,
+		})
+		snapshot.TotalDownloaded += task.Downloaded
+		if task.Total > 0 {
+			snapshot.KnownDownloaded += minInt64(task.Downloaded, task.Total)
+			snapshot.KnownTotal += task.Total
+		}
+	}
+	if len(tasks) > 0 {
+		snapshot.SummaryLine = r.progressLine(tasks)
+		snapshot.SpeedBytesPerSecond = r.speed
+	}
+	return snapshot
 }
 
 func (r *downloadRuntime) printf(format string, args ...interface{}) {
@@ -309,6 +352,7 @@ func (t *downloadTask) SetName(name string) {
 	t.name = name
 	t.updatedAt = time.Now()
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) SetTotal(total int64) {
@@ -321,6 +365,7 @@ func (t *downloadTask) SetTotal(total int64) {
 	}
 	t.updatedAt = time.Now()
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) SetState(state string) {
@@ -331,6 +376,7 @@ func (t *downloadTask) SetState(state string) {
 	t.state = state
 	t.updatedAt = time.Now()
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) SetDetail(detail string) {
@@ -341,6 +387,7 @@ func (t *downloadTask) SetDetail(detail string) {
 	t.detail = strings.TrimSpace(detail)
 	t.updatedAt = time.Now()
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) MarkStarted() {
@@ -360,6 +407,7 @@ func (t *downloadTask) MarkStarted() {
 	}
 	t.updatedAt = now
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) AddDownloaded(size int64) {
@@ -376,6 +424,7 @@ func (t *downloadTask) AddDownloaded(size int64) {
 	t.downloaded += size
 	t.updatedAt = now
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) SetDownloaded(size int64) {
@@ -396,6 +445,7 @@ func (t *downloadTask) SetDownloaded(size int64) {
 	}
 	t.updatedAt = now
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) MarkCompleted() {
@@ -412,6 +462,7 @@ func (t *downloadTask) MarkCompleted() {
 	t.completedAt = now
 	t.updatedAt = now
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) MarkSkipped(detail string) {
@@ -426,6 +477,7 @@ func (t *downloadTask) MarkSkipped(detail string) {
 	t.completedAt = now
 	t.updatedAt = now
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (t *downloadTask) MarkFailed(err error) {
@@ -444,6 +496,7 @@ func (t *downloadTask) MarkFailed(err error) {
 	t.completedAt = now
 	t.updatedAt = now
 	t.mu.Unlock()
+	t.runtime.emitProgress()
 }
 
 func (r *trackedReadCloser) Read(p []byte) (int, error) {

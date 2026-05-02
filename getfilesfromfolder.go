@@ -1,6 +1,6 @@
 // Package main (getfilesfromfolder.go) :
 // These methods are for downloading all files from a shared folder of Google Drive.
-package main
+package gdrivedl
 
 import (
 	"bytes"
@@ -197,7 +197,7 @@ func (p *para) makeFileByCondition(file *drive.File) error {
 // makeDir : Make a directory by checking duplication.
 func (p *para) makeDir(folder string) error {
 	if er := chkFile(folder); !er {
-		if err := os.Mkdir(folder, 0777); err != nil {
+		if err := os.MkdirAll(folder, 0777); err != nil {
 			return err
 		}
 	} else {
@@ -233,6 +233,7 @@ func (p *para) makeDirByCondition(dir string) error {
 			p.printf("Creating '%s' was skipped because of existing.\n", dir)
 		}
 	} else {
+		p.statusf("Creating directory path: %s", dir)
 		if err = p.makeDir(dir); err != nil {
 			return err
 		}
@@ -295,36 +296,54 @@ func (p *para) initDownload(fileList *folderListing) error {
 		workers = 1
 	}
 	jobCh := make(chan folderDownloadJob)
+	ctx := p.requestContext()
 	errCh := make(chan error, len(jobs))
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobCh {
-				jobPara := p.clone()
-				jobPara.WorkDir = job.Destination
-				jobPara.Filename = job.File.Name
-				jobPara.Size = job.File.Size
-				if jobPara.Runtime != nil {
-					jobPara.Task = jobPara.Runtime.newTask(job.Relative, job.File.Id)
-					jobPara.Task.SetTotal(job.File.Size)
-				}
-				if err := jobPara.makeFileByCondition(job.File); err != nil {
-					if jobPara.Task != nil {
-						jobPara.Task.MarkFailed(err)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobCh:
+					if !ok {
+						return
 					}
-					errCh <- err
+					jobPara := p.clone()
+					jobPara.WorkDir = job.Destination
+					jobPara.Filename = job.File.Name
+					jobPara.Size = job.File.Size
+					if jobPara.Runtime != nil {
+						jobPara.Task = jobPara.Runtime.newTask(job.Relative, job.File.Id)
+						jobPara.Task.SetTotal(job.File.Size)
+					}
+					if err := jobPara.makeFileByCondition(job.File); err != nil {
+						if jobPara.Task != nil {
+							jobPara.Task.MarkFailed(err)
+						}
+						errCh <- err
+					}
 				}
 			}
 		}()
 	}
 	for _, job := range jobs {
-		jobCh <- job
+		select {
+		case <-ctx.Done():
+			close(jobCh)
+			wg.Wait()
+			return ctx.Err()
+		case jobCh <- job:
+		}
 	}
 	close(jobCh)
 	wg.Wait()
 	close(errCh)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for err := range errCh {
 		if err != nil {
 			return err
@@ -672,7 +691,8 @@ func extractPublicDriveFolderAPIKeys(page string) []string {
 }
 
 func (p *para) discoverPublicFolderAPIKeys(client *http.Client, folderID string) ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, publicDriveFoldersPageBase+folderID, nil)
+	p.statusf("Fetching shared folder page to discover public listing API keys: %s", folderID)
+	req, err := http.NewRequestWithContext(p.requestContext(), http.MethodGet, publicDriveFoldersPageBase+folderID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -698,12 +718,14 @@ func (p *para) getFilesFromFolder() error {
 		err      error
 	)
 	if p.APIKey != "" {
-		srv, driveErr := p.newDriveService(context.Background())
+		p.statusf("Starting shared folder listing via Drive API: %s", p.SearchID)
+		srv, driveErr := p.newDriveService(p.requestContext())
 		if driveErr != nil {
 			return driveErr
 		}
 		fileList, err = p.listFolderFiles(srv, p.SearchID)
 	} else {
+		p.statusf("Starting public shared folder listing without API key: %s", p.SearchID)
 		fileList, err = p.listPublicFolderFiles(p.SearchID)
 	}
 	if err != nil {
@@ -725,12 +747,14 @@ func (p *para) getFilesFromFolder() error {
 }
 
 func (p *para) listPublicFolderFiles(rootID string) (*folderListing, error) {
+	p.statusf("Initializing HTTP client for public folder listing")
 	client, err := p.TransportConfig.newHTTPClient(nil)
 	if err != nil {
 		return nil, err
 	}
 	frontend := &publicDriveFrontendClient{APIKey: publicDriveFrontendAPIKey, Client: client}
-	root, err := frontend.getAccessibleRoot(context.Background(), rootID)
+	p.statusf("Requesting public folder root metadata: %s", rootID)
+	root, err := frontend.getAccessibleRoot(p.requestContext(), rootID)
 	if err != nil {
 		keys, discoverErr := p.discoverPublicFolderAPIKeys(client, rootID)
 		if discoverErr != nil {
@@ -741,7 +765,8 @@ func (p *para) listPublicFolderFiles(rootID string) (*folderListing, error) {
 				continue
 			}
 			frontend.APIKey = key
-			root, err = frontend.getAccessibleRoot(context.Background(), rootID)
+			p.statusf("Retrying public folder root metadata with discovered API key")
+			root, err = frontend.getAccessibleRoot(p.requestContext(), rootID)
 			if err == nil {
 				break
 			}
@@ -758,6 +783,7 @@ func (p *para) listPublicFolderFiles(rootID string) (*folderListing, error) {
 }
 
 func (p *para) listFolderFiles(srv *drive.Service, rootID string) (*folderListing, error) {
+	p.statusf("Requesting root folder metadata via Drive API: %s", rootID)
 	root, err := srv.Files.Get(rootID).Fields("id,name").SupportsAllDrives(true).Do()
 	if err != nil {
 		return nil, err
@@ -772,6 +798,10 @@ func (p *para) listFolderFiles(srv *drive.Service, rootID string) (*folderListin
 func (p *para) walkFolderFiles(srv *drive.Service, folderID string, tree []string, listing *folderListing) error {
 	pageToken := ""
 	for {
+		if err := p.contextErr(); err != nil {
+			return err
+		}
+		p.statusf("Requesting Drive API folder listing: folder=%s page=%s", folderID, firstNonEmpty(pageToken, "first"))
 		call := srv.Files.List().
 			Q(fmt.Sprintf("'%s' in parents and trashed = false", folderID)).
 			Fields("nextPageToken,files(id,name,mimeType,size,webContentLink,webViewLink)").
@@ -816,7 +846,11 @@ func (p *para) walkFolderFiles(srv *drive.Service, folderID string, tree []strin
 func (p *para) walkPublicFolderFiles(frontend *publicDriveFrontendClient, folderID string, tree []string, listing *folderListing) error {
 	pageToken := ""
 	for {
-		files, nextPageToken, err := frontend.listItems(context.Background(), folderID, pageToken)
+		if err := p.contextErr(); err != nil {
+			return err
+		}
+		p.statusf("Requesting public folder listing: folder=%s page=%s", folderID, firstNonEmpty(pageToken, "first"))
+		files, nextPageToken, err := frontend.listItems(p.requestContext(), folderID, pageToken)
 		if err != nil {
 			return err
 		}

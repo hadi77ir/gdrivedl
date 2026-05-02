@@ -1,6 +1,6 @@
 # gdrivedl
 
-`gdrivedl` is a CLI for downloading shared Google Drive files and folders.
+`gdrivedl` is a Go library and CLI for downloading shared Google Drive files and folders.
 
 It supports:
 
@@ -23,11 +23,32 @@ It supports:
 - Per-request server IP overrides with `--resolve-to`
 - Multiple downloads from a URL list file or standard input
 
-## Install
+## Install The CLI
 
 ```bash
-go install github.com/hadi77ir/gdrivedl@latest
+go install github.com/hadi77ir/gdrivedl/cmd/gdrivedl@latest
 ```
+
+## Use As A Go Package
+
+Import the root module in another Go program:
+
+```go
+import "github.com/hadi77ir/gdrivedl"
+```
+
+Minimal example:
+
+```go
+ctx := context.Background()
+err := gdrivedl.Download(ctx, gdrivedl.Request{
+    URL:     "https://drive.google.com/file/d/FILE_ID/view?usp=sharing",
+    WorkDir: "/tmp/downloads",
+    Proxy:   "http://127.0.0.1:2089",
+})
+```
+
+For UI integrations, use `gdrivedl.DownloadWithObserver` to receive periodic task snapshots and aggregate progress updates.
 
 ## API Key
 

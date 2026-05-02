@@ -40,4 +40,4 @@ $ gdrivedl -u [URL of shared folder on Google Drive] -key [API key]
 
 ---------------------------------------------------------------
 */
-package main
+package gdrivedl

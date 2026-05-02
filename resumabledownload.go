@@ -1,9 +1,8 @@
 // Package main (resumableDownload.go) :
 // These methods are for resumable downloading a shared file from Google Drive.
-package main
+package gdrivedl
 
 import (
-	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -132,7 +131,7 @@ func (v *valResumableDownload) resDownloadFileByAPIKey() (*http.Response, error)
 	if v.Client.Timeout == 0 {
 		v.Client.Timeout = time.Duration(timeOut) * time.Second
 	}
-	req, err := http.NewRequest("get", u.String(), nil)
+	req, err := http.NewRequestWithContext(v.requestContext(), "get", u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +154,7 @@ func (v *valResumableDownload) resDownloadFileByAPIKey() (*http.Response, error)
 
 // getFileInf : Retrieve file infomation using Drive API.
 func (v *valResumableDownload) getFileInf() error {
-	srv, err := v.newDriveService(context.Background())
+	srv, err := v.newDriveService(v.requestContext())
 	if err != nil {
 		return err
 	}
