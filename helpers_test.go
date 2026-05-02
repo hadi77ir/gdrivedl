@@ -36,6 +36,24 @@ func TestMainHelperFunctions(t *testing.T) {
 		}
 	})
 
+	t.Run("buildURLDownloadJobs pre-registers queued tasks", func(t *testing.T) {
+		runtime := newDownloadRuntime(false, false)
+		p := &para{Runtime: runtime}
+		jobs := buildURLDownloadJobs(p, []string{"https://example.com/1", "https://example.com/2", "https://example.com/3"})
+		if got, want := len(jobs), 3; got != want {
+			t.Fatalf("job count = %d, want %d", got, want)
+		}
+		tasks := runtime.snapshotTasks()
+		if got, want := len(tasks), 3; got != want {
+			t.Fatalf("queued task count = %d, want %d", got, want)
+		}
+		for _, task := range tasks {
+			if task.Status != taskPending || task.State != "queued" {
+				t.Fatalf("queued task = %#v", task)
+			}
+		}
+	})
+
 	t.Run("getFilename from header", func(t *testing.T) {
 		p := &para{}
 		res := &http.Response{
@@ -288,6 +306,12 @@ func TestConfigHelperFunctions(t *testing.T) {
 	if got, err := parseResolveTo("2001:db8::1"); err != nil || got != "2001:db8::1" {
 		t.Fatalf("parseResolveTo() = (%q, %v)", got, err)
 	}
+	if got, err := parseResolveToList("2001:db8::1,203.0.113.10"); err != nil || len(got) != 2 || got[0] != "2001:db8::1" || got[1] != "203.0.113.10" {
+		t.Fatalf("parseResolveToList() = (%#v, %v)", got, err)
+	}
+	if got, err := parseUTLSProfileList("firefox_auto,chrome_auto,firefox_auto"); err != nil || len(got) != 2 || got[0].name != "firefox_auto" || got[1].name != "chrome_auto" {
+		t.Fatalf("parseUTLSProfileList() = (%#v, %v)", got, err)
+	}
 	if got := requestHost(&http.Request{Host: "override.example", URL: mustParseURL(t, "https://example.com")}); got != "override.example" {
 		t.Fatalf("requestHost() = %q", got)
 	}
@@ -332,6 +356,16 @@ func TestConfigHelperFunctions(t *testing.T) {
 	profiles = transport.utlsHandshakeProfiles()
 	if len(profiles) < 4 || profiles[0].name != "firefox_auto" || profiles[1].name != "edge_auto" || profiles[len(profiles)-1].name != "chrome_auto" {
 		t.Fatalf("fronting utlsHandshakeProfiles() = %#v", profiles)
+	}
+
+	transport = transportConfig{UTLSProfiles: []utlsProfileOption{{name: "firefox_auto", id: supportedUTLSProfiles["firefox_auto"]}, {name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]}}, sharedState: newTransportSharedState()}
+	profiles = transport.utlsHandshakeProfiles()
+	if len(profiles) != 2 || profiles[0].name != "firefox_auto" || profiles[1].name != "chrome_auto" {
+		t.Fatalf("round-robin utlsHandshakeProfiles() first = %#v", profiles)
+	}
+	profiles = transport.utlsHandshakeProfiles()
+	if len(profiles) != 2 || profiles[0].name != "chrome_auto" || profiles[1].name != "firefox_auto" {
+		t.Fatalf("round-robin utlsHandshakeProfiles() second = %#v", profiles)
 	}
 
 	transport = transportConfig{PreferHTTP2: true, ForceHTTP1: true}

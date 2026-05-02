@@ -1,6 +1,7 @@
 package gdrivedl
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -118,4 +119,67 @@ func TestRuntimeProgressLine(t *testing.T) {
 			t.Fatalf("progress line %q missing %q", line, want)
 		}
 	}
+}
+
+func TestRuntimeStructuredEventsAndJSON(t *testing.T) {
+	var events []Event
+	runtime := newObservedDownloadRuntime(false, true, true, nil, func(event Event) {
+		events = append(events, event)
+	})
+	task := runtime.newTask("file.txt", "src")
+	task.SetTotal(5)
+
+	output := captureStdout(t, func() {
+		runtime.start()
+		runtime.log("status", "[status] hello\n", map[string]any{"message": "hello"})
+		task.MarkStarted()
+		task.SetDownloaded(5)
+		task.MarkCompleted()
+		runtime.finish()
+	})
+
+	if len(events) == 0 {
+		t.Fatal("expected structured events")
+	}
+	if events[0].Type == "" || events[0].Name == "" || events[0].Timestamp.IsZero() {
+		t.Fatalf("invalid first event: %#v", events[0])
+	}
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected JSON output lines")
+	}
+	var event Event
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if event.Type == "" || event.Name == "" || event.Timestamp.IsZero() {
+		t.Fatalf("unexpected event = %#v", event)
+	}
+	if !strings.Contains(output, "\"type\":") {
+		t.Fatalf("json output = %q", output)
+	}
+}
+
+func TestRuntimeJSONForcesExitReportEvents(t *testing.T) {
+	var events []Event
+	runtime := newObservedDownloadRuntime(false, false, true, nil, func(event Event) {
+		events = append(events, event)
+	})
+	task := runtime.newTask("file.txt", "src")
+	task.SetTotal(5)
+	task.MarkStarted()
+	task.SetDownloaded(5)
+	task.MarkCompleted()
+
+	_ = captureStdout(t, func() {
+		runtime.start()
+		runtime.finish()
+	})
+
+	for _, event := range events {
+		if event.Type == "report" && event.Name == "exit_item" {
+			return
+		}
+	}
+	t.Fatalf("expected exit_item report event, got %#v", events)
 }

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,6 +54,16 @@ type folderDownloadJob struct {
 	File        *drive.File
 	Relative    string
 	Destination string
+	Task        *downloadTask
+}
+
+type folderLocalFileState struct {
+	Path       string
+	Exists     bool
+	Complete   bool
+	Partial    bool
+	LocalSize  int64
+	RemoteSize int64
 }
 
 type publicDriveFrontendClient struct {
@@ -88,16 +99,20 @@ func newFolderDownloadPara(p *para, file *drive.File) *para {
 	downloadPara.WorkDir = p.WorkDir
 	downloadPara.Filename = firstNonEmpty(p.Filename, file.Name)
 	downloadPara.Size = file.Size
+	downloadPara.Kind = "file"
 	downloadPara.Task = p.Task
 	downloadPara.ID = file.Id
 	return downloadPara
 }
 
-// downloadFileByAPIKey : Download file using API key.
-func (p *para) downloadFileByAPIKey(file *drive.File) error {
+func (p *para) shouldUseFolderResumeFlow() bool {
+	return p != nil && p.APIKey != "" && p.Resumabledownload != ""
+}
+
+func (p *para) folderFileDownloadURL(file *drive.File) (string, error) {
 	u, err := url.Parse(driveAPI)
 	if err != nil {
-		return err
+		return "", err
 	}
 	u.Path = path.Join(u.Path, file.Id)
 	q := u.Query()
@@ -110,6 +125,106 @@ func (p *para) downloadFileByAPIKey(file *drive.File) error {
 		q.Set("supportsAllDrives", "true")
 	}
 	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+func (p *para) resolveFolderFileSize(file *drive.File) int64 {
+	if file == nil {
+		return 0
+	}
+	if file.Size > 0 {
+		return file.Size
+	}
+	if p == nil || p.APIKey == "" {
+		return 0
+	}
+	downloadPara := newFolderDownloadPara(p, file)
+	url, err := downloadPara.folderFileDownloadURL(file)
+	if err != nil {
+		return 0
+	}
+	downloadPara.Client, err = downloadPara.TransportConfig.newHTTPClient(nil)
+	if err != nil {
+		return 0
+	}
+	res, err := downloadPara.fetch(url)
+	if err != nil {
+		return 0
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return 0
+	}
+	return res.ContentLength
+}
+
+func (p *para) inspectFolderLocalFile(file *drive.File) folderLocalFileState {
+	filename := firstNonEmpty(p.Filename, file.Name)
+	state := folderLocalFileState{Path: filepath.Join(p.WorkDir, filename), RemoteSize: file.Size}
+	info, err := os.Stat(state.Path)
+	if err != nil {
+		return state
+	}
+	state.Exists = true
+	state.LocalSize = info.Size()
+	if state.RemoteSize <= 0 {
+		state.RemoteSize = p.resolveFolderFileSize(file)
+	}
+	if state.RemoteSize > 0 {
+		state.Complete = state.LocalSize == state.RemoteSize
+		state.Partial = state.LocalSize != state.RemoteSize
+		return state
+	}
+	state.Partial = true
+	return state
+}
+
+func folderPartialBackupPath(path string) string {
+	base := fmt.Sprintf("%s.gdrivedl-partial.%d.bak", path, time.Now().UnixNano())
+	if !chkFile(base) {
+		return base
+	}
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("%s.%d", base, index)
+		if !chkFile(candidate) {
+			return candidate
+		}
+	}
+}
+
+func (p *para) preservePartialFolderFile(state folderLocalFileState) (string, bool, error) {
+	if !state.Exists || !state.Partial || p.DryRun {
+		return "", false, nil
+	}
+	backupPath := folderPartialBackupPath(state.Path)
+	if err := os.Rename(state.Path, backupPath); err != nil {
+		return "", false, err
+	}
+	if p.Task != nil {
+		p.Task.SetDetail(filepath.Base(backupPath))
+	}
+	p.statusf("Preserved partial file before full redownload: %s -> %s", state.Path, backupPath)
+	return backupPath, true, nil
+}
+
+func (p *para) markFolderFileAlreadyComplete(state folderLocalFileState) {
+	if p.Task == nil {
+		return
+	}
+	if state.RemoteSize > 0 {
+		p.Task.SetTotal(state.RemoteSize)
+		p.Task.SetDownloaded(state.RemoteSize)
+	}
+	p.Task.SetDetail("already complete")
+	p.Task.MarkCompleted()
+}
+
+// downloadFileByAPIKey : Download file using API key.
+func (p *para) downloadFileByAPIKey(file *drive.File) error {
+	u, err := p.folderFileDownloadURL(file)
+	if err != nil {
+		return err
+	}
 	downloadPara := newFolderDownloadPara(p, file)
 	timeOut := func(size int64) int64 {
 		if size == 0 {
@@ -129,7 +244,7 @@ func (p *para) downloadFileByAPIKey(file *drive.File) error {
 	if downloadPara.Client.Timeout == 0 {
 		downloadPara.Client.Timeout = time.Duration(timeOut) * time.Second
 	}
-	res, err := downloadPara.fetch(u.String())
+	res, err := downloadPara.fetch(u)
 	if err != nil {
 		return err
 	}
@@ -163,15 +278,83 @@ func (p *para) downloadFileByPublicLink(file *drive.File) error {
 }
 
 func (p *para) downloadFolderFile(file *drive.File) error {
+	if p.shouldUseFolderResumeFlow() {
+		return p.downloadFolderFileWithResume(file)
+	}
+	return p.downloadFolderFileDirect(file)
+}
+
+func (p *para) downloadFolderFileDirect(file *drive.File) error {
 	if p.APIKey != "" {
 		return p.downloadFileByAPIKey(file)
 	}
 	return p.downloadFileByPublicLink(file)
 }
 
+func (p *para) resumeFolderFileChunk(file *drive.File) error {
+	if p.DryRun {
+		return p.resumableDryRunFromFile(file)
+	}
+	v, _, end, err := p.newResumableDownloadStateFromFile(file)
+	if err != nil {
+		return err
+	}
+	if end {
+		return nil
+	}
+	if v.Client == nil {
+		v.Client, err = v.TransportConfig.newHTTPClient(nil)
+		if err != nil {
+			return err
+		}
+	}
+	res, err := v.resDownloadFileByAPIKey()
+	if err != nil {
+		return err
+	}
+	return v.para.saveFile(res)
+}
+
+func (p *para) downloadFolderFileWithResumeStrategy(file *drive.File, resume func(*para, *drive.File) error, direct func(*para, *drive.File) error) error {
+	state := p.inspectFolderLocalFile(file)
+	if state.Complete {
+		p.statusf("Keeping existing completed file: %s", state.Path)
+		p.markFolderFileAlreadyComplete(state)
+		return nil
+	}
+	err := resume(p, file)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, errResumableFullRedownloadRequired) {
+		return err
+	}
+	backupPath, preserved, backupErr := p.preservePartialFolderFile(state)
+	if backupErr != nil {
+		return backupErr
+	}
+	if preserved {
+		p.statusf("Resumable download unavailable; restarting full download for %s", state.Path)
+	}
+	if err := direct(p, file); err != nil {
+		if preserved {
+			return fmt.Errorf("%w (partial file preserved at %s)", err, backupPath)
+		}
+		return err
+	}
+	if preserved {
+		_ = os.Remove(backupPath)
+	}
+	return nil
+}
+
+func (p *para) downloadFolderFileWithResume(file *drive.File) error {
+	return p.downloadFolderFileWithResumeStrategy(file, (*para).resumeFolderFileChunk, (*para).downloadFolderFileDirect)
+}
+
 // makeFileByCondition : Make file by condition.
 func (p *para) makeFileByCondition(file *drive.File) error {
-	if p.DryRun {
+	if p.DryRun || p.shouldUseFolderResumeFlow() {
 		return p.downloadFolderFile(file)
 	}
 	filename := firstNonEmpty(p.Filename, file.Name)
@@ -276,7 +459,12 @@ func (p *para) initDownload(fileList *folderListing) error {
 		for _, file := range e.Files {
 			if file.MimeType != "application/vnd.google-apps.script" {
 				relativeName := filepath.Join(append(append([]string(nil), relativeParts...), file.Name)...)
-				jobs = append(jobs, folderDownloadJob{File: file, Relative: relativeName, Destination: path})
+				job := folderDownloadJob{File: file, Relative: relativeName, Destination: path}
+				if p.Runtime != nil {
+					job.Task = p.Runtime.newTask(relativeName, file.Id)
+					job.Task.SetTotal(file.Size)
+				}
+				jobs = append(jobs, job)
 			} else {
 				if !p.Disp {
 					p.printf("'%s' is a project file. Project files cannot be downloaded from folder links.\n", file.Name)
@@ -315,13 +503,10 @@ func (p *para) initDownload(fileList *folderListing) error {
 					jobPara.WorkDir = job.Destination
 					jobPara.Filename = job.File.Name
 					jobPara.Size = job.File.Size
-					if jobPara.Runtime != nil {
-						jobPara.Task = jobPara.Runtime.newTask(job.Relative, job.File.Id)
-						jobPara.Task.SetTotal(job.File.Size)
-					}
+					jobPara.Task = job.Task
 					if err := jobPara.makeFileByCondition(job.File); err != nil {
 						if jobPara.Task != nil {
-							jobPara.Task.MarkFailed(err)
+							finishTaskWithError(jobPara.Task, err)
 						}
 						errCh <- err
 					}
@@ -732,6 +917,12 @@ func (p *para) getFilesFromFolder() error {
 		return err
 	}
 	if p.ShowFileInf {
+		if p.Runtime != nil && p.Runtime.hasStructuredOutput() {
+			p.reportEvent("folder_info", map[string]any{"listing": fileList})
+			if p.Runtime.jsonOutput {
+				return nil
+			}
+		}
 		r, err := json.Marshal(fileList)
 		if err != nil {
 			return err

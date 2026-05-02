@@ -58,6 +58,38 @@ func TestTransportConfigNewHTTPClientTimeout(t *testing.T) {
 	}
 }
 
+func TestTransportTraceJSONForcesLogs(t *testing.T) {
+	var events []Event
+	runtime := newObservedDownloadRuntime(false, false, true, nil, func(event Event) {
+		events = append(events, event)
+	})
+	task := runtime.newTask("file.bin", "src")
+	req, err := http.NewRequest("GET", "https://example.com/file", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req = withRequestTrace(req, runtime, task)
+
+	cfg := transportConfig{Verbosity: 0}
+	_ = captureStdout(t, func() {
+		cfg.logStage(req, "dialing", "address=%s", "example.com:443")
+		cfg.logDetail(req, 2, "tls negotiated protocol=%q", "h2")
+	})
+
+	var logCount int
+	for _, event := range events {
+		if event.Type == "log" {
+			logCount++
+		}
+	}
+	if logCount < 2 {
+		t.Fatalf("expected forced JSON log events, got %#v", events)
+	}
+	if task.snapshot().State != "dialing" {
+		t.Fatalf("task state = %q, want dialing", task.snapshot().State)
+	}
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stdout

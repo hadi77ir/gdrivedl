@@ -27,6 +27,14 @@ func requestTraceFromContext(ctx context.Context) *requestTrace {
 	return trace
 }
 
+func requestForcesJSONLogs(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	trace := requestTraceFromContext(req.Context())
+	return trace != nil && trace.runtime != nil && trace.runtime.forceJSONLogs()
+}
+
 func (cfg transportConfig) emitTrace(req *http.Request, message string) {
 	trace := requestTraceFromContext(req.Context())
 	label := req.URL.String()
@@ -36,7 +44,7 @@ func (cfg transportConfig) emitTrace(req *http.Request, message string) {
 	}
 	line := fmt.Sprintf("[http] %s | %s", label, message)
 	if trace != nil && trace.runtime != nil {
-		trace.runtime.printf("%s\n", line)
+		trace.runtime.log("http", line+"\n", map[string]any{"label": label, "message": message})
 		return
 	}
 	fmt.Printf("%s\n", line)
@@ -51,7 +59,7 @@ func (cfg transportConfig) setTaskState(req *http.Request, state string) {
 
 func (cfg transportConfig) logStage(req *http.Request, state string, format string, args ...interface{}) {
 	cfg.setTaskState(req, state)
-	if cfg.Verbosity <= 0 {
+	if cfg.Verbosity <= 0 && !requestForcesJSONLogs(req) {
 		return
 	}
 	extra := strings.TrimSpace(fmt.Sprintf(format, args...))
@@ -63,7 +71,7 @@ func (cfg transportConfig) logStage(req *http.Request, state string, format stri
 }
 
 func (cfg transportConfig) logDetail(req *http.Request, minVerbosity int, format string, args ...interface{}) {
-	if cfg.Verbosity < minVerbosity {
+	if cfg.Verbosity < minVerbosity && !requestForcesJSONLogs(req) {
 		return
 	}
 	cfg.emitTrace(req, fmt.Sprintf(format, args...))

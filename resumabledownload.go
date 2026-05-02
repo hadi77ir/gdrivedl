@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,8 @@ import (
 	drive "google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 )
+
+var errResumableFullRedownloadRequired = errors.New("resumable download requires full redownload")
 
 // valResumableDownload : Structure for resumable download
 type valResumableDownload struct {
@@ -59,6 +62,12 @@ func (p *para) showFileInf() error {
 	dlfile, err := p.getFileInfFromP()
 	if err != nil {
 		return err
+	}
+	if p.Runtime != nil && p.Runtime.hasStructuredOutput() {
+		p.reportEvent("file_info", map[string]any{"file": dlfile})
+		if p.Runtime.jsonOutput {
+			return nil
+		}
 	}
 	r, err := json.Marshal(dlfile)
 	if err != nil {
@@ -141,6 +150,11 @@ func (v *valResumableDownload) resDownloadFileByAPIKey() (*http.Response, error)
 	if err != nil {
 		return nil, err
 	}
+	if res.StatusCode == http.StatusOK && v.Start > 0 {
+		defer res.Body.Close()
+		_, _ = io.Copy(io.Discard, res.Body)
+		return nil, fmt.Errorf("%w: range request was ignored for %s", errResumableFullRedownloadRequired, v.Filename)
+	}
 	if res.StatusCode != 206 && res.StatusCode != 200 {
 		r, err := io.ReadAll(res.Body)
 		if err != nil {
@@ -150,6 +164,55 @@ func (v *valResumableDownload) resDownloadFileByAPIKey() (*http.Response, error)
 		return nil, fmt.Errorf("%s", r)
 	}
 	return res, nil
+}
+
+func cloneDriveFile(file *drive.File) *drive.File {
+	if file == nil {
+		return nil
+	}
+	clone := *file
+	return &clone
+}
+
+func (p *para) newResumableDownloadStateFromFile(file *drive.File) (*valResumableDownload, bool, bool, error) {
+	if file == nil {
+		return nil, false, false, fmt.Errorf("file metadata is required")
+	}
+	downloadBytes, err := getDownloadBytes(p.Resumabledownload)
+	if err != nil {
+		return nil, false, false, err
+	}
+	v := &valResumableDownload{para: *p}
+	v.DownloadBytes = downloadBytes
+	v.DownloadFile = cloneDriveFile(file)
+	v.ID = file.Id
+	if v.DownloadFile.Name == "" || v.DownloadFile.MimeType == "" || v.DownloadFile.Size <= 0 {
+		if err := v.getFileInf(); err != nil {
+			return nil, false, false, err
+		}
+	}
+	if strings.Contains(v.DownloadFile.MimeType, "application/vnd.google-apps") {
+		return nil, false, false, fmt.Errorf("%w: Google Docs exports cannot be resumed", errResumableFullRedownloadRequired)
+	}
+	if v.DownloadFile.Size <= 0 {
+		return nil, false, false, fmt.Errorf("%w: remote file size is unavailable", errResumableFullRedownloadRequired)
+	}
+	fc, end, err := v.chkResumeFile()
+	if err != nil {
+		if strings.Contains(err.Error(), "larger than that of local file") {
+			return nil, false, false, fmt.Errorf("%w: %v", errResumableFullRedownloadRequired, err)
+		}
+		return nil, false, false, err
+	}
+	p.Filename = v.Filename
+	p.Size = v.DownloadFile.Size
+	p.DownloadBytes = downloadBytes
+	if p.Task != nil {
+		p.Task.SetName(v.Filename)
+		p.Task.SetTotal(v.DownloadFile.Size)
+		p.Task.SetDownloaded(v.CurrentFileSize)
+	}
+	return v, fc, end, nil
 }
 
 // getFileInf : Retrieve file infomation using Drive API.
@@ -407,6 +470,31 @@ func (p *para) resumableDryRun() error {
 	if v.Task != nil {
 		v.Task.SetName(v.Filename)
 		v.Task.SetTotal(v.DownloadFile.Size)
+	}
+	v.Client, err = v.TransportConfig.newHTTPClient(nil)
+	if err != nil {
+		return err
+	}
+	res, err := v.resDownloadFileByAPIKey()
+	if err != nil {
+		return err
+	}
+	return v.para.completeDryRun(res)
+}
+
+func (p *para) resumableDryRunFromFile(file *drive.File) error {
+	v, _, end, err := p.newResumableDownloadStateFromFile(file)
+	if err != nil {
+		return err
+	}
+	if end {
+		if p.Task != nil {
+			p.Task.SetTotal(v.DownloadFile.Size)
+			p.Task.SetDownloaded(v.DownloadFile.Size)
+			p.Task.SetDetail("already complete")
+			p.Task.MarkCompleted()
+		}
+		return nil
 	}
 	v.Client, err = v.TransportConfig.newHTTPClient(nil)
 	if err != nil {

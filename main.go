@@ -14,6 +14,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -31,6 +32,7 @@ const (
 	anyurl                     = "https://drive.google.com/uc?export=download"
 	docutl                     = "https://docs.google.com/"
 	googleLoginRequiredMessage = "Google login/sign-in is required for this link. gdrivedl only supports public links that do not require interactive Google sign-in."
+	appContextMetadataKey      = "gdrivedl-context"
 )
 
 // chunks : For io.Reader
@@ -56,12 +58,14 @@ type para struct {
 	Filename              string
 	ID                    string
 	InputtedMimeType      []string
+	JSONOutput            bool
 	Kind                  string
 	MaxConcurrency        int
 	Notcreatetopdirectory bool
 	OverWrite             bool
 	Resumabledownload     string
 	Runtime               *downloadRuntime
+	Scan                  bool
 	SearchID              string
 	ShowFileInf           bool
 	Size                  int64
@@ -96,11 +100,27 @@ func (p *para) printf(format string, args ...interface{}) {
 	fmt.Printf(format, args...)
 }
 
+func (p *para) forceJSONLogs() bool {
+	return p != nil && p.Runtime != nil && p.Runtime.forceJSONLogs()
+}
+
 func (p *para) statusf(format string, args ...interface{}) {
 	if p == nil {
 		return
 	}
+	if p.Runtime != nil {
+		message := fmt.Sprintf(format, args...)
+		p.Runtime.log("status", "[status] "+message+"\n", map[string]any{"message": message})
+		return
+	}
 	p.printf("[status] "+format+"\n", args...)
+}
+
+func (p *para) reportEvent(name string, fields map[string]any) {
+	if p == nil || p.Runtime == nil {
+		return
+	}
+	p.Runtime.report(name, fields)
 }
 
 func (p *para) traceRequest(req *http.Request) *http.Request {
@@ -269,7 +289,7 @@ func (p *para) saveFile(res *http.Response) (err error) {
 		return err
 	}
 	defer file.Close()
-	showLegacyProgress := !p.Disp && !p.EnableProgress && p.MaxConcurrency <= 1
+	showLegacyProgress := !p.JSONOutput && !p.Disp && !p.EnableProgress && p.MaxConcurrency <= 1
 	bodyReader := io.Reader(res.Body)
 	if showLegacyProgress {
 		if p.APIKey != "" {
@@ -284,6 +304,9 @@ func (p *para) saveFile(res *http.Response) (err error) {
 		_, err = io.Copy(file, bodyReader)
 	}
 	if err != nil {
+		if isCancellationError(err) {
+			_ = file.Sync()
+		}
 		return err
 	}
 	fileInfo, err := file.Stat()
@@ -296,7 +319,13 @@ func (p *para) saveFile(res *http.Response) (err error) {
 	if p.Task != nil {
 		p.Task.MarkCompleted()
 	}
-	if p.TransportConfig.Verbosity >= 2 {
+	p.reportEvent("download_complete", map[string]any{
+		"file":      p.Filename,
+		"kind":      p.Kind,
+		"mime_type": p.ContentType,
+		"file_size": fileInfo.Size(),
+	})
+	if p.TransportConfig.Verbosity >= 2 || p.forceJSONLogs() {
 		p.printf("[http] %s | response body complete bytes=%d\n", firstNonEmpty(p.Filename, p.URL), fileInfo.Size())
 	}
 	if p.CompletionReport {
@@ -333,7 +362,13 @@ func (p *para) completeDryRun(res *http.Response) error {
 		p.Task.MarkCompleted()
 		p.Task.SetState("dry run complete")
 	}
-	if p.TransportConfig.Verbosity >= 2 {
+	p.reportEvent("dry_run_complete", map[string]any{
+		"file":        firstNonEmpty(p.Filename, p.URL, "(unknown)"),
+		"kind":        p.Kind,
+		"mime_type":   p.ContentType,
+		"http_status": res.Status,
+	})
+	if p.TransportConfig.Verbosity >= 2 || p.forceJSONLogs() {
 		p.printf("[http] %s | dry run complete status=%s\n", firstNonEmpty(p.Filename, p.URL, "(unknown)"), res.Status)
 	}
 	if p.CompletionReport {
@@ -571,7 +606,7 @@ func (p *para) download(url string) (err error) {
 	if p.APIKey != "" && p.ShowFileInf {
 		return nil
 	} else if p.APIKey == "" && p.ShowFileInf {
-		return errors.New("when you want to use the option '--fileinf', please use API key")
+		return errors.New("when you want to use the option '--file-info', please use API key")
 	}
 	if p.Runtime != nil && p.Task == nil {
 		p.Task = p.Runtime.newTask(firstNonEmpty(p.Filename, url), url)
@@ -580,7 +615,7 @@ func (p *para) download(url string) (err error) {
 		}
 		defer func() {
 			if err != nil {
-				p.Task.MarkFailed(err)
+				finishTaskWithError(p.Task, err)
 			}
 		}()
 	}
@@ -590,8 +625,22 @@ func (p *para) download(url string) (err error) {
 	return p.downloadResolvedURL()
 }
 
-// handler : Initialize of "para".
-func handler(c *cli.Context) error {
+func commandContext(c *cli.Context) context.Context {
+	if c != nil && c.App != nil && c.App.Metadata != nil {
+		if ctx, ok := c.App.Metadata[appContextMetadataKey].(context.Context); ok && ctx != nil {
+			return ctx
+		}
+	}
+	return context.Background()
+}
+
+func handleRootCommand(c *cli.Context) error {
+	cli.ShowAppHelp(c)
+	return nil
+}
+
+// handleGetCommand initializes and runs the download command.
+func handleGetCommand(c *cli.Context) error {
 	cfg, err := parseConfig(c, os.Getenv, filepath.Abs)
 	if err != nil {
 		return err
@@ -603,8 +652,9 @@ func handler(c *cli.Context) error {
 		return fmt.Errorf("'--filename' cannot be used with '--url-list'")
 	}
 	p := cfg.toPara()
-	if cfg.EnableProgress || cfg.ExitReport || cfg.MaxConcurrency > 1 {
-		p.Runtime = newDownloadRuntime(cfg.EnableProgress, cfg.ExitReport)
+	p.Context = commandContext(c)
+	if cfg.EnableProgress || cfg.ExitReport || cfg.MaxConcurrency > 1 || cfg.JSONOutput {
+		p.Runtime = newObservedDownloadRuntime(cfg.EnableProgress, cfg.ExitReport, cfg.JSONOutput, nil, nil)
 		p.Runtime.start()
 		defer p.Runtime.finish()
 	}
@@ -623,10 +673,8 @@ func handler(c *cli.Context) error {
 		return nil
 	}
 	if term.IsTerminal(int(syscall.Stdin)) {
-		if cfg.URL == "" {
-			createHelp().Run(os.Args)
-			return nil
-		}
+		cli.ShowCommandHelp(c, "get")
+		return nil
 	} else {
 		urls, err := readURLs(os.Stdin)
 		if err != nil {
@@ -637,15 +685,131 @@ func handler(c *cli.Context) error {
 	return nil
 }
 
+func handleScanCommand(c *cli.Context) error {
+	options, err := parseScanCommandOptionsWithEnv(c, defaultCLIParseEnvironment())
+	if err != nil {
+		return err
+	}
+	if options.ScanDomainList == "-" && options.ScanIPList == "-" {
+		return fmt.Errorf("--scan-domain-list - cannot share standard input with --scan-ip-list -")
+	}
+	transport, err := buildScanTransportConfigFromOptions(options.transportOptionFlags)
+	if err != nil {
+		return err
+	}
+	resolveToAddrs, err := parseResolveToList(options.ResolveTo)
+	if err != nil {
+		return err
+	}
+	frontingTargets, err := parseHostnameList(options.FrontingTarget, "--fronting-target")
+	if err != nil {
+		return err
+	}
+	frontingSNIs, err := parseHostnameList(options.FrontingSNI, "--fronting-sni")
+	if err != nil {
+		return err
+	}
+	extraScanDomains := []string(nil)
+	extraScanIPs := []string(nil)
+	if options.ScanDomainList != "" {
+		extraScanDomains, err = readHostnameList(options.ScanDomainList, os.Stdin)
+		if err != nil {
+			return err
+		}
+	}
+	if options.ScanIPList != "" {
+		extraScanIPs, err = readIPSpecList(options.ScanIPList, os.Stdin)
+		if err != nil {
+			return err
+		}
+	}
+	report, scanErr := runConnectivityScan(commandContext(c), transport, connectivityScanOptions{
+		Mode:            options.ScanMode,
+		ExtraDomains:    extraScanDomains,
+		ExtraIPSpecs:    extraScanIPs,
+		FrontingSNIs:    frontingSNIs,
+		FrontingTargets: frontingTargets,
+		ResolveToAddrs:  resolveToAddrs,
+	}, scanDependencies{})
+	if options.JSONOutput {
+		runtime := newObservedDownloadRuntime(false, false, true, nil, nil)
+		runtime.report("scan", report.fields())
+	} else {
+		report.print(os.Stdout)
+	}
+	if scanErr == nil && strings.TrimSpace(options.SavePath) != "" {
+		if err := saveScanReportYAML(options.SavePath, report); err != nil {
+			return err
+		}
+	}
+	return scanErr
+}
+
+func handleMergeCommand(c *cli.Context) error {
+	options, err := parseMergeCommandOptionsWithEnv(c, defaultCLIParseEnvironment())
+	if err != nil {
+		return err
+	}
+	return Merge(commandContext(c), MergeRequest{
+		DeleteChunks:         options.DeleteChunks,
+		Inputs:               options.Inputs,
+		Output:               options.Output,
+		Overwrite:            options.Overwrite,
+		ExitReport:           options.ExitReport,
+		JSONOutput:           options.JSONOutput,
+		ShowTerminalProgress: options.Progress,
+		Unsafe:               options.Unsafe,
+		Verbosity:            options.Verbosity,
+	})
+}
+
+func handleTestConnectivityCommand(c *cli.Context) error {
+	options, err := parseTestCommandOptionsWithEnv(c, defaultCLIParseEnvironment())
+	if err != nil {
+		return err
+	}
+	transport, err := buildTransportConfigFromOptions(options.transportOptionFlags)
+	if err != nil {
+		return err
+	}
+	runtime := (*downloadRuntime)(nil)
+	if options.JSONOutput {
+		runtime = newObservedDownloadRuntime(false, false, true, nil, nil)
+	}
+	report, err := testConnectivityWithTransport(commandContext(c), transport, runtime, scanProbeURL)
+	if !options.JSONOutput {
+		report.print(os.Stdout)
+	}
+	return err
+}
+
+type urlDownloadJob struct {
+	URL  string
+	Task *downloadTask
+}
+
+func buildURLDownloadJobs(p *para, urls []string) []urlDownloadJob {
+	jobs := make([]urlDownloadJob, 0, len(urls))
+	for _, rawURL := range urls {
+		job := urlDownloadJob{URL: rawURL}
+		if p != nil && p.Runtime != nil {
+			job.Task = p.Runtime.newTask(rawURL, rawURL)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs
+}
+
 func downloadURLList(p *para, urls []string) error {
 	if len(urls) == 0 {
 		return fmt.Errorf("no URL data. Please check help\n\n $ %s --help", appname)
 	}
+	jobs := buildURLDownloadJobs(p, urls)
 	workers := p.MaxConcurrency
 	if workers < 1 {
 		workers = 1
 	}
-	jobs := make(chan string)
+	jobCh := make(chan urlDownloadJob)
 	ctx := p.requestContext()
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -656,29 +820,30 @@ func downloadURLList(p *para, urls []string) error {
 				select {
 				case <-ctx.Done():
 					return
-				case rawURL, ok := <-jobs:
+				case job, ok := <-jobCh:
 					if !ok {
 						return
 					}
 					jobPara := p.clone()
 					jobPara.Filename = ""
-					if err := jobPara.download(rawURL); err != nil {
+					jobPara.Task = job.Task
+					if err := jobPara.download(job.URL); err != nil {
 						jobPara.printf("## Skipped: Error: %v\n", err)
 					}
 				}
 			}
 		}()
 	}
-	for _, rawURL := range urls {
+	for _, job := range jobs {
 		select {
 		case <-ctx.Done():
-			close(jobs)
+			close(jobCh)
 			wg.Wait()
 			return ctx.Err()
-		case jobs <- rawURL:
+		case jobCh <- job:
 		}
 	}
-	close(jobs)
+	close(jobCh)
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -721,145 +886,46 @@ func createHelp() *cli.App {
 	a := cli.NewApp()
 	a.Name = appname
 	a.Authors = []cli.Author{
-		{Name: "hadi77ir [ https://github.com/hadi77ir/gdrivedl ] "},
+		{Name: "hadi77ir", Email: "https://github.com/hadi77ir/gdrivedl"},
 	}
-	a.UsageText = "Download shared files on Google Drive."
+	a.Usage = "CLI and Go library for public Google Drive downloads and transport probing."
+	a.UsageText = "gdrivedl <command> [command options] [arguments...]"
+	a.Description = "gdrivedl downloads public Google Drive files and folders, probes direct and fronted network routes, and merges split chunk folders. Run 'gdrivedl help <command>' for command-specific usage. Each subcommand accepts '--config' and loads defaults from '$XDG_CONFIG_DIR/gdrivedl.yml', then '$XDG_CONFIG_HOME/gdrivedl.yml', when those files exist."
 	a.Version = Version
-	a.Flags = []cli.Flag{
-		&cli.StringFlag{
-			Name:  "url, u",
-			Usage: "URL of shared file on Google Drive. Required unless --url-list is used.",
+	a.Commands = []cli.Command{
+		{
+			Name:        "get",
+			Usage:       "Download public Google Drive files, folders, and URL lists.",
+			UsageText:   "gdrivedl get --url <drive-url> [options]\n   gdrivedl get --url-list <file|-> [options]",
+			Description: "Download shared Google Drive files or folders without OAuth, or process many URLs from a file or standard input. Use '--config' to load default command values from YAML.",
+			Action:      handleGetCommand,
+			Flags:       getCommandCLIFlags(),
 		},
-		&cli.StringFlag{
-			Name:  "url-list",
-			Usage: "Path to a newline-delimited URL list. Use '-' to read the list from standard input.",
+		{
+			Name:        "scan",
+			Usage:       "Probe viable direct and fronted transport routes.",
+			UsageText:   "gdrivedl scan [options]",
+			Description: "Probe https://gstatic.com/generate_204 in selectable phases. 'full' runs IP discovery first and then fronting-domain/SNI probing, 'only-ip' scans accessible IPs, and 'only-domains' validates fronting targets and SNIs against the provided --resolve-to IP list. The report prints reusable --fronting-target, --fronting-sni, --resolve-to, and --utls-profile values, and '--save' can merge those values into a YAML config file. Use '--config' to load default scan settings from YAML.",
+			Action:      handleScanCommand,
+			Flags:       scanCommandCLIFlags(),
 		},
-		&cli.StringFlag{
-			Name:  "extension, e",
-			Usage: "Extension of output file. This is for only Google Docs (Spreadsheet, Document, Presentation).",
-			Value: "pdf",
+		{
+			Name:        "test",
+			Aliases:     []string{"probe"},
+			Usage:       "Send one transport probe to https://gstatic.com/generate_204.",
+			UsageText:   "gdrivedl test [options]",
+			Description: "Validate a candidate proxy, resolve-to IP, fronting target, HTTP version preference, and uTLS profile without starting a download. Use '--config' to load default transport settings from YAML.",
+			Action:      handleTestConnectivityCommand,
+			Flags:       testCommandCLIFlags(),
 		},
-		&cli.StringFlag{
-			Name:  "filename, f",
-			Usage: "Filename of file which is output. When this was not used, the original filename on Google Drive is used.",
-		},
-		&cli.StringSliceFlag{
-			Name:  "mimetype, m",
-			Usage: "mimeType (You can retrieve only files with the specific mimeType, when files are downloaded from a folder.) ex. '-m \"mimeType1,mimeType2\"'",
-		},
-		&cli.StringFlag{
-			Name:  "resumabledownload, r",
-			Usage: "File is downloaded as the resumable download. For example, when '-r 1m' is used, the size of 1 MB is downloaded and create new file or append the existing file. API key is required.",
-		},
-		&cli.BoolFlag{
-			Name:  "NoProgress, np",
-			Usage: "When this option is used, the progression is not shown.",
-		},
-		&cli.BoolFlag{
-			Name:  "progress",
-			Usage: "Show aggregate download progress with current file, total progress, speed, and ETA.",
-		},
-		&cli.IntFlag{
-			Name:  "concurrency",
-			Usage: "Maximum number of concurrent downloads for URL lists and folder downloads.",
-			Value: 1,
-		},
-		&cli.BoolFlag{
-			Name:  "exit-report",
-			Usage: "Print a final per-file download report on exit.",
-		},
-		&cli.BoolFlag{
-			Name:  "completion-report",
-			Usage: "Print a per-file completion report line after each successful download.",
-		},
-		&cli.BoolFlag{
-			Name:  "dry-run",
-			Usage: "Send download requests for testing without saving files or creating directories.",
-		},
-		&cli.BoolFlag{
-			Name:  "overwrite, o",
-			Usage: "When filename of downloading file is existing in directory at local PC, overwrite it. At default, it is not overwritten.",
-		},
-		&cli.BoolFlag{
-			Name:  "skip, s",
-			Usage: "When filename of downloading file is existing in directory at local PC, skip it. At default, it is not overwritten.",
-		},
-		&cli.BoolFlag{
-			Name:  "fileinf, i",
-			Usage: "Retrieve file information. API key is required for individual file metadata; public folder links can be listed without an API key.",
-		},
-		&cli.StringFlag{
-			Name:  "apikey, key",
-			Usage: "Optional Google API key used for resumable downloads, file metadata, and Drive API-based folder access.",
-		},
-		&cli.StringFlag{
-			Name:  "directory, d",
-			Usage: "Directory for saving downloaded files. When this is not used, the files are saved to the current working directory.",
-		},
-		&cli.BoolFlag{
-			Name:  "notcreatetopdirectory, ntd",
-			Usage: "When this option is NOT used (default situation), when a folder including subfolders is downloaded, the top folder which is downloaded is created as the top directory under the working directory. When this option is used, the top directory is not created and all files and subfolders under the top folder are downloaded under the working directory.",
-		},
-		&cli.BoolFlag{
-			Name:  "skiperror, se",
-			Usage: "When the files are downloaded from the folder, if an error occurs, the error is skipped by this option.",
-		},
-		&cli.StringFlag{
-			Name:  "proxy",
-			Usage: "Upstream proxy URL. Supported schemes are http:// and socks5://. Example: http://127.0.0.1:2089.",
-		},
-		&cli.StringFlag{
-			Name:  "timeout",
-			Usage: "HTTP client timeout. Accepts Go duration strings like 30s, 2m, or plain seconds like 60.",
-		},
-		&cli.StringFlag{
-			Name:  "request-delay",
-			Usage: "Minimum delay between HTTP requests. Accepts Go duration strings like 500ms, 2s, or plain seconds like 1.",
-		},
-		&cli.IntFlag{
-			Name:  "verbosity",
-			Usage: "HTTP logging verbosity level. 0 disables stage logs, 1 enables stage and status logs, 2 adds detailed connection logs.",
-			Value: 0,
-		},
-		&cli.BoolFlag{
-			Name:  "dump-request",
-			Usage: "Dump outgoing HTTP requests before they are sent.",
-		},
-		&cli.BoolFlag{
-			Name:  "dump-response",
-			Usage: "Dump received HTTP response headers after they are received.",
-		},
-		&cli.StringFlag{
-			Name:  "resolve-to",
-			Usage: "Override the network dial IP for requests while preserving the original request port and logical host. Use an IP address.",
-		},
-		&cli.StringFlag{
-			Name:  "utls-profile",
-			Usage: "uTLS ClientHello profile for HTTPS requests. Supported values include chrome_auto, firefox_auto, safari_auto, ios_auto, edge_auto, 360_auto, qq_auto, randomized, randomized_alpn, and randomized_no_alpn.",
-		},
-		&cli.BoolFlag{
-			Name:  "prefer-http2",
-			Usage: "Prefer HTTP/2 over HTTP/1.1 for HTTPS requests when the server supports it.",
-		},
-		&cli.BoolFlag{
-			Name:  "force-http1",
-			Usage: "Force HTTP/1.1 for HTTPS requests and disable HTTP/2 negotiation.",
-		},
-		&cli.BoolFlag{
-			Name:  "share-http2-connection",
-			Usage: "Reuse a negotiated HTTP/2 TLS connection for multiple requests to the same target. Implies HTTP/2 preference and cannot be combined with --force-http1.",
-		},
-		&cli.BoolFlag{
-			Name:  "fronting-enable",
-			Usage: "Enable HTTP domain fronting in the shared transport for all requests.",
-		},
-		&cli.StringFlag{
-			Name:  "fronting-sni",
-			Usage: "Optional TLS SNI override for fronted requests. Defaults to the fronting target hostname. Requires --fronting-enable.",
-		},
-		&cli.StringFlag{
-			Name:  "fronting-target",
-			Usage: "Fronting target hostname used for network dial. The original request port is preserved. Requires --fronting-enable.",
+		{
+			Name:        "merge",
+			Aliases:     []string{"combine"},
+			Usage:       "Merge chunk files into one file with safe mode enabled by default.",
+			UsageText:   "gdrivedl merge --output <file> [merge options] [input paths...]",
+			Description: "Combine chunk files from a single folder or from multiple split_nnnn folders into one final output. Safe mode writes to a temporary file first and supports cancellation. Use '--config' to load default merge settings from YAML.",
+			Action:      handleMergeCommand,
+			Flags:       mergeCLIFlags(),
 		},
 	}
 	return a
@@ -867,6 +933,12 @@ func createHelp() *cli.App {
 
 func RunCLI(args []string) error {
 	a := createHelp()
-	a.Action = handler
+	a.Action = handleRootCommand
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if a.Metadata == nil {
+		a.Metadata = map[string]interface{}{}
+	}
+	a.Metadata[appContextMetadataKey] = ctx
 	return a.Run(args)
 }

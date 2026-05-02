@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -49,10 +50,14 @@ type config struct {
 	ExitReport            bool
 	Filename              string
 	InputtedMimeType      []string
+	JSONOutput            bool
 	MaxConcurrency        int
 	Notcreatetopdirectory bool
 	OverWrite             bool
 	Resumabledownload     string
+	Scan                  bool
+	ScanDomainList        string
+	ScanIPList            string
 	ShowFileInf           bool
 	Skip                  bool
 	SkipError             bool
@@ -63,20 +68,26 @@ type config struct {
 }
 
 type transportConfig struct {
-	DumpRequest     bool
-	DumpResponse    bool
-	Fronting        frontingConfig
-	ForceHTTP1      bool
-	PreferHTTP2     bool
-	Proxy           *url.URL
-	RequestDelay    time.Duration
-	ResolveTo       string
-	ShareHTTP2Conn  bool
-	Timeout         time.Duration
-	UTLSProfile     utls.ClientHelloID
-	UTLSProfileName string
-	Verbosity       int
-	sharedState     *transportSharedState
+	DumpRequest         bool
+	DumpResponse        bool
+	Fronting            frontingConfig
+	ForceHTTP1          bool
+	PreferHTTP2         bool
+	Proxy               *url.URL
+	RetryCount          int
+	RequestDelay        time.Duration
+	ResolveTo           string
+	ResolveToAddrs      []string
+	Scan                bool
+	ScanIPRandomCount   int
+	ShareHTTP2Conn      bool
+	Timeout             time.Duration
+	UTLSProfile         utls.ClientHelloID
+	UTLSProfileName     string
+	UTLSProfiles        []utlsProfileOption
+	Verbosity           int
+	disableUTLSFallback bool
+	sharedState         *transportSharedState
 }
 
 type utlsProfileOption struct {
@@ -85,9 +96,11 @@ type utlsProfileOption struct {
 }
 
 type frontingConfig struct {
-	Enable bool
-	SNI    string
-	Target string
+	Enable      bool
+	SNI         string
+	Target      string
+	Targets     []string
+	explicitSNI bool
 }
 
 type transportRequestPlan struct {
@@ -98,8 +111,12 @@ type transportRequestPlan struct {
 }
 
 type transportSharedState struct {
-	delayMu     sync.Mutex
-	lastRequest time.Time
+	delayMu              sync.Mutex
+	lastRequest          time.Time
+	roundRobinMu         sync.Mutex
+	frontingTargetCursor int
+	resolveToCursor      int
+	utlsProfileCursor    int
 
 	http2Mu    sync.Mutex
 	http2Conns map[string][]*sharedHTTP2Conn
@@ -110,48 +127,225 @@ type sharedHTTP2Conn struct {
 	conn       net.Conn
 }
 
-func parseConfig(c *cli.Context, getenv func(string) string, absPath func(string) (string, error)) (*config, error) {
-	workdir := c.String("directory")
-	var err error
-	if workdir == "" {
-		workdir, err = absPath(".")
-		if err != nil {
-			return nil, err
+func cliFlagIsSet(c *cli.Context, name string) bool {
+	if c == nil {
+		return false
+	}
+	return c.IsSet(name) || c.GlobalIsSet(name)
+}
+
+func cliResolvedFlagNames(c *cli.Context, name string) []string {
+	if c == nil {
+		return []string{name}
+	}
+	findNames := func(flags []cli.Flag) []string {
+		for _, flg := range flags {
+			names := splitCLIFlagNames(flg.GetName())
+			for _, candidate := range names {
+				if candidate == name {
+					return names
+				}
+			}
+		}
+		return nil
+	}
+	if names := findNames(c.Command.Flags); len(names) > 0 {
+		return names
+	}
+	if c.App != nil {
+		if names := findNames(c.App.Flags); len(names) > 0 {
+			return names
 		}
 	}
-	transport, err := parseTransportConfig(c)
-	if err != nil {
-		return nil, err
+	return []string{name}
+}
+
+func splitCLIFlagNames(raw string) []string {
+	parts := strings.Split(raw, ",")
+	names := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			names = append(names, part)
+		}
 	}
-	apiKey := strings.TrimSpace(c.String("apikey"))
-	if apiKey == "" {
-		apiKey = strings.TrimSpace(getenv(envval))
+	return names
+}
+
+func cliString(c *cli.Context, name string) string {
+	if c == nil {
+		return ""
 	}
-	if apiKey == "" {
-		apiKey = strings.TrimSpace(getenv(legacyEnvval))
+	names := cliResolvedFlagNames(c, name)
+	foundSet := false
+	for _, candidate := range names {
+		if c.IsSet(candidate) {
+			foundSet = true
+			if value := c.String(candidate); value != "" {
+				return value
+			}
+		}
 	}
-	return &config{
-		APIKey:                apiKey,
-		CompletionReport:      c.Bool("completion-report"),
-		Disp:                  c.Bool("NoProgress"),
-		DryRun:                c.Bool("dry-run"),
-		EnableProgress:        c.Bool("progress"),
-		Ext:                   c.String("extension"),
-		ExitReport:            c.Bool("exit-report"),
-		Filename:              c.String("filename"),
-		InputtedMimeType:      splitCommaSeparated(c.StringSlice("mimetype")),
-		MaxConcurrency:        c.Int("concurrency"),
-		Notcreatetopdirectory: c.Bool("notcreatetopdirectory"),
-		OverWrite:             c.Bool("overwrite"),
-		Resumabledownload:     c.String("resumabledownload"),
-		ShowFileInf:           c.Bool("fileinf"),
-		Skip:                  c.Bool("skip"),
-		SkipError:             c.Bool("skiperror"),
-		Transport:             transport,
-		URL:                   c.String("url"),
-		URLList:               c.String("url-list"),
-		WorkDir:               workdir,
-	}, nil
+	if foundSet {
+		return ""
+	}
+	foundSet = false
+	for _, candidate := range names {
+		if c.GlobalIsSet(candidate) {
+			foundSet = true
+			if value := c.GlobalString(candidate); value != "" {
+				return value
+			}
+		}
+	}
+	if foundSet {
+		return ""
+	}
+	for _, candidate := range names {
+		if value := c.String(candidate); value != "" {
+			return value
+		}
+	}
+	for _, candidate := range names {
+		if value := c.GlobalString(candidate); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func cliBool(c *cli.Context, name string) bool {
+	if c == nil {
+		return false
+	}
+	names := cliResolvedFlagNames(c, name)
+	foundSet := false
+	for _, candidate := range names {
+		if c.IsSet(candidate) {
+			foundSet = true
+			if c.Bool(candidate) {
+				return true
+			}
+		}
+	}
+	if foundSet {
+		return false
+	}
+	foundSet = false
+	for _, candidate := range names {
+		if c.GlobalIsSet(candidate) {
+			foundSet = true
+			if c.GlobalBool(candidate) {
+				return true
+			}
+		}
+	}
+	if foundSet {
+		return false
+	}
+	for _, candidate := range names {
+		if c.Bool(candidate) {
+			return true
+		}
+	}
+	for _, candidate := range names {
+		if c.GlobalBool(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func cliInt(c *cli.Context, name string) int {
+	if c == nil {
+		return 0
+	}
+	names := cliResolvedFlagNames(c, name)
+	foundSet := false
+	for _, candidate := range names {
+		if c.IsSet(candidate) {
+			foundSet = true
+			if value := c.Int(candidate); value != 0 {
+				return value
+			}
+		}
+	}
+	if foundSet {
+		return 0
+	}
+	foundSet = false
+	for _, candidate := range names {
+		if c.GlobalIsSet(candidate) {
+			foundSet = true
+			if value := c.GlobalInt(candidate); value != 0 {
+				return value
+			}
+		}
+	}
+	if foundSet {
+		return 0
+	}
+	for _, candidate := range names {
+		if value := c.Int(candidate); value != 0 {
+			return value
+		}
+	}
+	for _, candidate := range names {
+		if value := c.GlobalInt(candidate); value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func cliStringSlice(c *cli.Context, name string) []string {
+	if c == nil {
+		return nil
+	}
+	names := cliResolvedFlagNames(c, name)
+	foundSet := false
+	for _, candidate := range names {
+		if c.IsSet(candidate) {
+			foundSet = true
+			if value := c.StringSlice(candidate); len(value) > 0 {
+				return value
+			}
+		}
+	}
+	if foundSet {
+		return nil
+	}
+	foundSet = false
+	for _, candidate := range names {
+		if c.GlobalIsSet(candidate) {
+			foundSet = true
+			if value := c.GlobalStringSlice(candidate); len(value) > 0 {
+				return value
+			}
+		}
+	}
+	if foundSet {
+		return nil
+	}
+	for _, candidate := range names {
+		if value := c.StringSlice(candidate); len(value) > 0 {
+			return value
+		}
+	}
+	for _, candidate := range names {
+		if value := c.GlobalStringSlice(candidate); len(value) > 0 {
+			return value
+		}
+	}
+	return nil
+}
+
+func parseConfig(c *cli.Context, getenv func(string) string, absPath func(string) (string, error)) (*config, error) {
+	return parseGetCommandConfigWithEnv(c, cliParseEnvironment{
+		getenv:        getenv,
+		userConfigDir: os.UserConfigDir,
+		absPath:       absPath,
+	})
 }
 
 func (cfg *config) toPara() *para {
@@ -167,107 +361,18 @@ func (cfg *config) toPara() *para {
 		ExitReport:            cfg.ExitReport,
 		Filename:              cfg.Filename,
 		InputtedMimeType:      cfg.InputtedMimeType,
+		JSONOutput:            cfg.JSONOutput,
 		MaxConcurrency:        cfg.MaxConcurrency,
 		Notcreatetopdirectory: cfg.Notcreatetopdirectory,
 		OverWrite:             cfg.OverWrite,
 		Resumabledownload:     cfg.Resumabledownload,
+		Scan:                  cfg.Scan,
 		ShowFileInf:           cfg.ShowFileInf,
 		Skip:                  cfg.Skip,
 		SkipError:             cfg.SkipError,
 		TransportConfig:       cfg.Transport,
 		WorkDir:               cfg.WorkDir,
 	}
-}
-
-func parseTransportConfig(c *cli.Context) (transportConfig, error) {
-	if c.Bool("progress") && c.Bool("NoProgress") {
-		return transportConfig{}, fmt.Errorf("please use either '--progress' or '--NoProgress'")
-	}
-	if c.Int("concurrency") < 1 {
-		return transportConfig{}, fmt.Errorf("--concurrency must be greater than 0")
-	}
-	preferHTTP2 := c.Bool("prefer-http2")
-	forceHTTP1 := c.Bool("force-http1")
-	shareHTTP2Conn := c.Bool("share-http2-connection")
-	if preferHTTP2 && forceHTTP1 {
-		return transportConfig{}, fmt.Errorf("--prefer-http2 cannot be used with --force-http1")
-	}
-	if shareHTTP2Conn && forceHTTP1 {
-		return transportConfig{}, fmt.Errorf("--share-http2-connection cannot be used with --force-http1")
-	}
-	proxyURL, err := parseProxyURL(c.String("proxy"))
-	if err != nil {
-		return transportConfig{}, err
-	}
-	fronting, err := parseFrontingConfig(c)
-	if err != nil {
-		return transportConfig{}, err
-	}
-	resolveTo, err := parseResolveTo(c.String("resolve-to"))
-	if err != nil {
-		return transportConfig{}, err
-	}
-	profileName, profileID, err := parseUTLSProfile(c.String("utls-profile"))
-	if err != nil {
-		return transportConfig{}, err
-	}
-	timeout, err := parseTimeout(c.String("timeout"))
-	if err != nil {
-		return transportConfig{}, err
-	}
-	requestDelay, err := parseFlexibleDuration(c.String("request-delay"), "--request-delay")
-	if err != nil {
-		return transportConfig{}, err
-	}
-	verbosity, err := parseVerbosity(c.Int("verbosity"))
-	if err != nil {
-		return transportConfig{}, err
-	}
-	return transportConfig{
-		DumpRequest:     c.Bool("dump-request"),
-		DumpResponse:    c.Bool("dump-response"),
-		Fronting:        fronting,
-		ForceHTTP1:      forceHTTP1,
-		PreferHTTP2:     preferHTTP2,
-		Proxy:           proxyURL,
-		RequestDelay:    requestDelay,
-		ResolveTo:       resolveTo,
-		ShareHTTP2Conn:  shareHTTP2Conn,
-		Timeout:         timeout,
-		UTLSProfile:     profileID,
-		UTLSProfileName: profileName,
-		Verbosity:       verbosity,
-		sharedState:     newTransportSharedState(),
-	}, nil
-}
-
-func parseFrontingConfig(c *cli.Context) (frontingConfig, error) {
-	enabled := c.Bool("fronting-enable")
-	target := strings.TrimSpace(c.String("fronting-target"))
-	sni := strings.TrimSpace(c.String("fronting-sni"))
-	if !enabled {
-		if target != "" || sni != "" {
-			return frontingConfig{}, fmt.Errorf("fronting options require --fronting-enable")
-		}
-		return frontingConfig{}, nil
-	}
-	if target == "" {
-		return frontingConfig{}, fmt.Errorf("--fronting-target is required when --fronting-enable is set")
-	}
-	var err error
-	target, err = parseHostnameValue(target, "--fronting-target")
-	if err != nil {
-		return frontingConfig{}, err
-	}
-	if sni == "" {
-		sni = target
-	} else {
-		sni, err = parseHostnameValue(sni, "--fronting-sni")
-		if err != nil {
-			return frontingConfig{}, err
-		}
-	}
-	return frontingConfig{Enable: true, SNI: sni, Target: target}, nil
 }
 
 func splitCommaSeparated(values []string) []string {
@@ -291,6 +396,23 @@ func parseHostnameValue(value, flagName string) (string, error) {
 	return strings.ToLower(parsed.Hostname()), nil
 }
 
+func parseHostnameList(raw, flagName string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	values := splitCommaSeparated([]string{raw})
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		hostname, err := parseHostnameValue(value, flagName)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, hostname)
+	}
+	return dedupeStrings(out), nil
+}
+
 func parseProxyURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -312,27 +434,64 @@ func parseProxyURL(raw string) (*url.URL, error) {
 }
 
 func parseResolveTo(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	values, err := parseResolveToList(raw)
+	if err != nil {
+		return "", err
+	}
+	if len(values) == 0 {
 		return "", nil
 	}
-	ip := net.ParseIP(raw)
-	if ip == nil {
-		return "", fmt.Errorf("--resolve-to must be an IP address")
+	return values[0], nil
+}
+
+func parseResolveToList(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
 	}
-	return ip.String(), nil
+	values := splitCommaSeparated([]string{raw})
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		ip := net.ParseIP(value)
+		if ip == nil {
+			return nil, fmt.Errorf("--resolve-to must be an IP address")
+		}
+		out = append(out, ip.String())
+	}
+	return out, nil
 }
 
 func parseUTLSProfile(raw string) (string, utls.ClientHelloID, error) {
+	profiles, err := parseUTLSProfileList(raw)
+	if err != nil {
+		return "", utls.ClientHelloID{}, err
+	}
+	return profiles[0].name, profiles[0].id, nil
+}
+
+func parseUTLSProfileList(raw string) ([]utlsProfileOption, error) {
 	if strings.TrimSpace(raw) == "" {
-		return "chrome_auto", supportedUTLSProfiles["chrome_auto"], nil
+		return []utlsProfileOption{{name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]}}, nil
 	}
-	profileName := normalizeUTLSProfileName(raw)
-	profileID, ok := supportedUTLSProfiles[profileName]
-	if !ok {
-		return "", utls.ClientHelloID{}, fmt.Errorf("unsupported --utls-profile %q (supported: %s)", raw, strings.Join(supportedUTLSProfileNames(), ", "))
+	values := splitCommaSeparated([]string{raw})
+	profiles := make([]utlsProfileOption, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		profileName := normalizeUTLSProfileName(value)
+		profileID, ok := supportedUTLSProfiles[profileName]
+		if !ok {
+			return nil, fmt.Errorf("unsupported --utls-profile %q (supported: %s)", value, strings.Join(supportedUTLSProfileNames(), ", "))
+		}
+		if _, exists := seen[profileName]; exists {
+			continue
+		}
+		seen[profileName] = struct{}{}
+		profiles = append(profiles, utlsProfileOption{name: profileName, id: profileID})
 	}
-	return profileName, profileID, nil
+	if len(profiles) == 0 {
+		return nil, fmt.Errorf("unsupported --utls-profile %q (supported: %s)", raw, strings.Join(supportedUTLSProfileNames(), ", "))
+	}
+	return profiles, nil
 }
 
 func parseTimeout(raw string) (time.Duration, error) {
@@ -365,6 +524,33 @@ func parseVerbosity(value int) (int, error) {
 		return 0, fmt.Errorf("--verbosity must be greater than or equal to 0")
 	}
 	return value, nil
+}
+
+func parseRetryCount(value int) (int, error) {
+	if value < 0 {
+		return 0, fmt.Errorf("--retry-count must be greater than or equal to 0")
+	}
+	return value, nil
+}
+
+func parseScanIPRandomCount(value int) (int, error) {
+	if value < 0 {
+		return 0, fmt.Errorf("--scan-ip-random-count must be greater than or equal to 0")
+	}
+	return value, nil
+}
+
+func parseScanMode(raw string) (scanMode, error) {
+	mode := scanMode(strings.ToLower(strings.TrimSpace(raw)))
+	if mode == "" {
+		return scanModeFull, nil
+	}
+	switch mode {
+	case scanModeFull, scanModeOnlyIP, scanModeOnlyDomains:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported --scan-mode %q (supported: full, only-ip, only-domains)", raw)
+	}
 }
 
 func normalizeUTLSProfileName(raw string) string {
@@ -413,9 +599,53 @@ func (cfg transportConfig) state() *transportSharedState {
 	return newTransportSharedState()
 }
 
+func (cfg transportConfig) configuredUTLSProfiles() []utlsProfileOption {
+	if len(cfg.UTLSProfiles) > 0 {
+		return append([]utlsProfileOption(nil), cfg.UTLSProfiles...)
+	}
+	if cfg.UTLSProfileName != "" {
+		return []utlsProfileOption{{name: cfg.UTLSProfileName, id: cfg.UTLSProfile}}
+	}
+	return []utlsProfileOption{{name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]}}
+}
+
+func rotateUTLSProfiles(values []utlsProfileOption, start int) []utlsProfileOption {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]utlsProfileOption, 0, len(values))
+	for index := 0; index < len(values); index++ {
+		out = append(out, values[(start+index)%len(values)])
+	}
+	return out
+}
+
+func (cfg transportConfig) utlsProfilesInRoundRobinOrder() []utlsProfileOption {
+	profiles := cfg.configuredUTLSProfiles()
+	if len(profiles) <= 1 {
+		return profiles
+	}
+	state := cfg.state()
+	state.roundRobinMu.Lock()
+	start := state.utlsProfileCursor % len(profiles)
+	state.utlsProfileCursor = (state.utlsProfileCursor + 1) % len(profiles)
+	state.roundRobinMu.Unlock()
+	return rotateUTLSProfiles(profiles, start)
+}
+
 func (cfg transportConfig) utlsHandshakeProfiles() []utlsProfileOption {
-	profiles := []utlsProfileOption{{name: cfg.UTLSProfileName, id: cfg.UTLSProfile}}
-	if cfg.UTLSProfileName != "chrome_auto" {
+	configured := cfg.utlsProfilesInRoundRobinOrder()
+	if len(configured) == 0 {
+		configured = []utlsProfileOption{{name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]}}
+	}
+	if cfg.disableUTLSFallback {
+		return []utlsProfileOption{configured[0]}
+	}
+	if len(configured) > 1 {
+		return configured
+	}
+	profiles := []utlsProfileOption{configured[0]}
+	if configured[0].name != "chrome_auto" {
 		return profiles
 	}
 	if cfg.Fronting.Enable {
@@ -493,15 +723,17 @@ func (cfg transportConfig) applyProxy(transport *http.Transport) error {
 }
 
 func (cfg transportConfig) buildRequestPlan(req *http.Request) transportRequestPlan {
+	selectedFrontingTarget := cfg.selectedFrontingTarget()
+	selectedResolveTo := cfg.selectedResolveTo()
 	logicalHost := req.URL.Hostname()
 	serverName := logicalHost
 	dialHost := logicalHost
-	if cfg.Fronting.Match(logicalHost) {
-		dialHost = cfg.Fronting.Target
-		serverName = cfg.Fronting.SNI
+	if cfg.Fronting.Match(logicalHost) && selectedFrontingTarget != "" {
+		dialHost = selectedFrontingTarget
+		serverName = cfg.frontingServerName(selectedFrontingTarget)
 	}
-	if cfg.ResolveTo != "" {
-		dialHost = cfg.ResolveTo
+	if selectedResolveTo != "" {
+		dialHost = selectedResolveTo
 	}
 	port := req.URL.Port()
 	if port == "" {
@@ -520,7 +752,7 @@ func (cfg transportConfig) buildRequestPlan(req *http.Request) transportRequestP
 }
 
 func (cfg transportConfig) rewritesNetworkDestination(plan transportRequestPlan) bool {
-	return cfg.ResolveTo != "" || plan.ServerName != plan.LogicalHost || plan.ConnectAddress != net.JoinHostPort(plan.LogicalHost, requestPort(plan, ""))
+	return len(cfg.ResolveToAddrs) > 0 || cfg.ResolveTo != "" || plan.ServerName != plan.LogicalHost || plan.ConnectAddress != net.JoinHostPort(plan.LogicalHost, requestPort(plan, ""))
 }
 
 func requestPort(plan transportRequestPlan, fallback string) string {
@@ -537,9 +769,88 @@ type smartRoundTripper struct {
 }
 
 func (rt *smartRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := rt.waitRequestDelay(req.Context(), req); err != nil {
+	attempts := rt.config.RetryCount + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	canRetryRequest := req.Body == nil || req.GetBody != nil
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		attemptReq, err := cloneRequestForRoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+		if err := rt.waitRequestDelay(attemptReq.Context(), attemptReq); err != nil {
+			return nil, err
+		}
+		var res *http.Response
+		if rt.config.Scan && attemptReq.URL.Scheme == "https" {
+			res, err = rt.roundTripScanned(attemptReq)
+		} else {
+			res, err = rt.roundTripOnce(attemptReq)
+		}
+		if err == nil {
+			if attempt < attempts && shouldRetryHTTPStatus(res.StatusCode) {
+				rt.config.logDetail(attemptReq, 1, "retrying request attempt=%d/%d status=%s", attempt+1, attempts, res.Status)
+				discardAndCloseResponse(res)
+				continue
+			}
+			return res, nil
+		}
+		lastErr = err
+		if attempt >= attempts || !canRetryRequest || !shouldRetryRequestError(err) {
+			return nil, err
+		}
+		rt.config.logDetail(attemptReq, 1, "retrying request attempt=%d/%d error=%v", attempt+1, attempts, err)
+	}
+	return nil, lastErr
+}
+
+func cloneRequestForRoundTrip(req *http.Request) (*http.Request, error) {
+	if req == nil {
+		return nil, fmt.Errorf("request is required")
+	}
+	clone := req.Clone(req.Context())
+	if req.Body == nil {
+		return clone, nil
+	}
+	if req.GetBody == nil {
+		return clone, nil
+	}
+	body, err := req.GetBody()
+	if err != nil {
 		return nil, err
 	}
+	clone.Body = body
+	return clone, nil
+}
+
+func shouldRetryHTTPStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetryRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err != context.Canceled && err != context.DeadlineExceeded
+}
+
+func discardAndCloseResponse(res *http.Response) {
+	if res == nil || res.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, res.Body)
+	_ = res.Body.Close()
+}
+
+func (rt *smartRoundTripper) roundTripOnce(req *http.Request) (*http.Response, error) {
 	plan := rt.config.buildRequestPlan(req)
 	if req.URL.Scheme != "https" {
 		clone := req.Clone(req.Context())
@@ -651,6 +962,7 @@ func (rt *smartRoundTripper) roundTripHTTP2(req *http.Request, conn net.Conn, sh
 
 func (rt *smartRoundTripper) dialTLSConnection(ctx context.Context, plan transportRequestPlan, req *http.Request) (net.Conn, string, error) {
 	profiles := rt.config.utlsHandshakeProfiles()
+	requestedProfileName := profiles[0].name
 	var lastErr error
 	for index, profile := range profiles {
 		conn, err := rt.dialProxyAwareTCP(ctx, plan.ConnectAddress, req)
@@ -680,7 +992,7 @@ func (rt *smartRoundTripper) dialTLSConnection(ctx context.Context, plan transpo
 			}
 			return nil, "", err
 		}
-		if profile.name != rt.config.UTLSProfileName {
+		if profile.name != requestedProfileName {
 			rt.config.logDetail(req, 1, "tls handshake fallback profile=%s", profile.name)
 		}
 		rt.config.logDetail(req, 2, "tls negotiated protocol=%q", uconn.ConnectionState().NegotiatedProtocol)
@@ -763,7 +1075,11 @@ func (rt *smartRoundTripper) sharedHTTP2Key(plan transportRequestPlan) string {
 	if rt.config.Proxy != nil {
 		proxyAddress = rt.config.Proxy.String()
 	}
-	return strings.Join([]string{plan.ConnectAddress, plan.HostHeader, plan.ServerName, proxyAddress, rt.config.UTLSProfileName}, "\x00")
+	profileName := rt.config.UTLSProfileName
+	if configured := rt.config.configuredUTLSProfiles(); len(configured) > 0 {
+		profileName = configured[0].name
+	}
+	return strings.Join([]string{plan.ConnectAddress, plan.HostHeader, plan.ServerName, proxyAddress, profileName}, "\x00")
 }
 
 func (rt *smartRoundTripper) getSharedHTTP2Conn(plan transportRequestPlan) (string, *sharedHTTP2Conn, bool) {

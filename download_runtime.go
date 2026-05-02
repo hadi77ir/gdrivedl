@@ -1,8 +1,12 @@
 package gdrivedl
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,15 +18,18 @@ const (
 	taskPending     downloadTaskStatus = "pending"
 	taskDownloading downloadTaskStatus = "downloading"
 	taskCompleted   downloadTaskStatus = "completed"
+	taskCancelled   downloadTaskStatus = "cancelled"
 	taskSkipped     downloadTaskStatus = "skipped"
 	taskFailed      downloadTaskStatus = "failed"
 )
 
 type downloadRuntime struct {
-	showProgress bool
-	exitReport   bool
-	startedAt    time.Time
-	observer     func(ProgressSnapshot)
+	showProgress     bool
+	exitReport       bool
+	jsonOutput       bool
+	startedAt        time.Time
+	progressObserver func(ProgressSnapshot)
+	eventObserver    EventObserver
 
 	mu          sync.RWMutex
 	tasks       []*downloadTask
@@ -69,24 +76,26 @@ type taskSnapshot struct {
 }
 
 func newDownloadRuntime(showProgress, exitReport bool) *downloadRuntime {
-	return newObservedDownloadRuntime(showProgress, exitReport, nil)
+	return newObservedDownloadRuntime(showProgress, exitReport, false, nil, nil)
 }
 
-func newObservedDownloadRuntime(showProgress, exitReport bool, observer func(ProgressSnapshot)) *downloadRuntime {
+func newObservedDownloadRuntime(showProgress, exitReport, jsonOutput bool, progressObserver func(ProgressSnapshot), eventObserver EventObserver) *downloadRuntime {
 	now := time.Now()
 	return &downloadRuntime{
-		showProgress: showProgress,
-		exitReport:   exitReport,
-		startedAt:    now,
-		observer:     observer,
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
-		lastTick:     now,
+		showProgress:     showProgress,
+		exitReport:       exitReport || jsonOutput,
+		jsonOutput:       jsonOutput,
+		startedAt:        now,
+		progressObserver: progressObserver,
+		eventObserver:    eventObserver,
+		stopCh:           make(chan struct{}),
+		doneCh:           make(chan struct{}),
+		lastTick:         now,
 	}
 }
 
 func (r *downloadRuntime) start() {
-	if r == nil || (!r.showProgress && r.observer == nil) {
+	if r == nil || (!r.showProgress && r.progressObserver == nil && !r.hasStructuredOutput()) {
 		return
 	}
 	go r.renderLoop()
@@ -96,7 +105,7 @@ func (r *downloadRuntime) finish() {
 	if r == nil {
 		return
 	}
-	if r.showProgress || r.observer != nil {
+	if r.showProgress || r.progressObserver != nil || r.hasStructuredOutput() {
 		close(r.stopCh)
 		<-r.doneCh
 	}
@@ -143,11 +152,84 @@ func (r *downloadRuntime) newTask(name, source string) *downloadTask {
 	return task
 }
 
-func (r *downloadRuntime) emitProgress() {
-	if r == nil || r.observer == nil {
+func (r *downloadRuntime) hasStructuredOutput() bool {
+	return r != nil && (r.jsonOutput || r.eventObserver != nil)
+}
+
+func (r *downloadRuntime) forceJSONLogs() bool {
+	return r != nil && r.jsonOutput
+}
+
+func (r *downloadRuntime) emitEvent(eventType, name string, fields map[string]any) {
+	if !r.hasStructuredOutput() {
 		return
 	}
-	r.observer(r.progressSnapshot())
+	event := newEvent(eventType, name, fields)
+	if r.eventObserver != nil {
+		r.eventObserver(event)
+	}
+	if !r.jsonOutput {
+		return
+	}
+	r.printMu.Lock()
+	defer r.printMu.Unlock()
+	r.clearProgressLineLocked()
+	if err := json.NewEncoder(os.Stdout).Encode(event); err != nil {
+		fmt.Printf("{\"timestamp\":%q,\"type\":\"log\",\"name\":\"json_encode_error\",\"fields\":{\"error\":%q}}\n", time.Now().UTC().Format(time.RFC3339Nano), err.Error())
+	}
+}
+
+func (r *downloadRuntime) writeText(format string, args ...interface{}) {
+	if r == nil {
+		fmt.Printf(format, args...)
+		return
+	}
+	r.printMu.Lock()
+	defer r.printMu.Unlock()
+	r.clearProgressLineLocked()
+	fmt.Printf(format, args...)
+}
+
+func (r *downloadRuntime) log(name, text string, fields map[string]any) {
+	message := trimStructuredMessage(text)
+	if message != "" {
+		if fields == nil {
+			fields = map[string]any{}
+		}
+		if _, ok := fields["message"]; !ok {
+			fields["message"] = message
+		}
+		r.emitEvent("log", name, fields)
+	} else if r.hasStructuredOutput() && len(fields) > 0 {
+		r.emitEvent("log", name, fields)
+	}
+	if r == nil || !r.jsonOutput {
+		r.writeText("%s", text)
+	}
+}
+
+func (r *downloadRuntime) report(name string, fields map[string]any) {
+	r.emitEvent("report", name, fields)
+}
+
+func (r *downloadRuntime) emitProgress() {
+	if r == nil {
+		return
+	}
+	snapshot := r.progressSnapshot()
+	if r.progressObserver != nil {
+		r.progressObserver(snapshot)
+	}
+	if r.hasStructuredOutput() {
+		r.emitEvent("progress", "update", map[string]any{
+			"summary_line":           snapshot.SummaryLine,
+			"total_downloaded":       snapshot.TotalDownloaded,
+			"known_downloaded":       snapshot.KnownDownloaded,
+			"known_total":            snapshot.KnownTotal,
+			"speed_bytes_per_second": snapshot.SpeedBytesPerSecond,
+			"tasks":                  snapshot.Tasks,
+		})
+	}
 }
 
 func (r *downloadRuntime) progressSnapshot() ProgressSnapshot {
@@ -182,14 +264,11 @@ func (r *downloadRuntime) printf(format string, args ...interface{}) {
 		fmt.Printf(format, args...)
 		return
 	}
-	r.printMu.Lock()
-	defer r.printMu.Unlock()
-	r.clearProgressLineLocked()
-	fmt.Printf(format, args...)
+	r.log("message", fmt.Sprintf(format, args...), nil)
 }
 
 func (r *downloadRuntime) renderProgress() {
-	if r == nil || !r.showProgress {
+	if r == nil || !r.showProgress || r.jsonOutput {
 		return
 	}
 	tasks := r.snapshotTasks()
@@ -309,23 +388,37 @@ func (r *downloadRuntime) printExitReport() {
 	if len(tasks) == 0 {
 		return
 	}
+	if r.hasStructuredOutput() {
+		for _, task := range tasks {
+			r.report("exit_item", map[string]any{
+				"file":       firstNonEmpty(task.Name, task.Source, "(unknown)"),
+				"source":     task.Source,
+				"state":      task.State,
+				"status":     string(task.Status),
+				"detail":     task.Detail,
+				"percent":    taskPercent(task),
+				"total":      task.Total,
+				"downloaded": task.Downloaded,
+			})
+		}
+		if r.jsonOutput {
+			return
+		}
+	}
 	nameWidth := len("FILE")
 	for _, task := range tasks {
 		if length := len(firstNonEmpty(task.Name, task.Source, "(unknown)")); length > nameWidth {
 			nameWidth = length
 		}
 	}
-	r.printMu.Lock()
-	defer r.printMu.Unlock()
-	r.clearProgressLineLocked()
-	fmt.Printf("Exit report:\n")
-	fmt.Printf("%-*s  %-9s  %s\n", nameWidth, "FILE", "PERCENT", "STATUS")
+	r.writeText("Exit report:\n")
+	r.writeText("%-*s  %-9s  %s\n", nameWidth, "FILE", "PERCENT", "STATUS")
 	for _, task := range tasks {
 		status := string(task.Status)
 		if task.Detail != "" {
 			status += " (" + task.Detail + ")"
 		}
-		fmt.Printf("%-*s  %8.1f%%  %s\n", nameWidth, firstNonEmpty(task.Name, task.Source, "(unknown)"), taskPercent(task), status)
+		r.writeText("%-*s  %8.1f%%  %s\n", nameWidth, firstNonEmpty(task.Name, task.Source, "(unknown)"), taskPercent(task), status)
 	}
 }
 
@@ -480,13 +573,28 @@ func (t *downloadTask) MarkSkipped(detail string) {
 	t.runtime.emitProgress()
 }
 
+func (t *downloadTask) MarkCancelled(detail string) {
+	if t == nil {
+		return
+	}
+	now := time.Now()
+	t.mu.Lock()
+	t.status = taskCancelled
+	t.state = "cancelled"
+	t.detail = detail
+	t.completedAt = now
+	t.updatedAt = now
+	t.mu.Unlock()
+	t.runtime.emitProgress()
+}
+
 func (t *downloadTask) MarkFailed(err error) {
 	if t == nil || err == nil {
 		return
 	}
 	now := time.Now()
 	t.mu.Lock()
-	if t.status == taskCompleted || t.status == taskSkipped {
+	if t.status == taskCompleted || t.status == taskSkipped || t.status == taskCancelled {
 		t.mu.Unlock()
 		return
 	}
@@ -497,6 +605,21 @@ func (t *downloadTask) MarkFailed(err error) {
 	t.updatedAt = now
 	t.mu.Unlock()
 	t.runtime.emitProgress()
+}
+
+func isCancellationError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func finishTaskWithError(task *downloadTask, err error) {
+	if task == nil || err == nil {
+		return
+	}
+	if isCancellationError(err) {
+		task.MarkCancelled("cancelled")
+		return
+	}
+	task.MarkFailed(err)
 }
 
 func (r *trackedReadCloser) Read(p []byte) (int, error) {

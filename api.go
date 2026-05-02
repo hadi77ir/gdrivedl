@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -15,9 +16,11 @@ type Request struct {
 	APIKey                string
 	CompletionReport      bool
 	DryRun                bool
+	EventObserver         EventObserver
 	Extension             string
 	ExitReport            bool
 	Filename              string
+	JSONOutput            bool
 	MimeTypes             []string
 	NotCreateTopDirectory bool
 	Overwrite             bool
@@ -36,8 +39,10 @@ type Request struct {
 	ForceHTTP1           bool
 	PreferHTTP2          bool
 	Proxy                string
+	RetryCount           int
 	RequestDelay         time.Duration
 	ResolveTo            string
+	Scan                 bool
 	ShareHTTP2Conn       bool
 	ShowTerminalProgress bool
 	Timeout              time.Duration
@@ -67,8 +72,37 @@ type ProgressSnapshot struct {
 
 type ProgressObserver func(ProgressSnapshot)
 
+type ConnectivityReport struct {
+	ProbeURL        string
+	Status          string
+	StatusCode      int
+	Protocol        string
+	Proxy           string
+	RetryCount      int
+	FrontingEnabled bool
+	FrontingTargets []string
+	FrontingSNI     string
+	ResolveToAddrs  []string
+	UTLSProfiles    []string
+}
+
 func Download(ctx context.Context, req Request) error {
 	return DownloadWithObserver(ctx, req, nil)
+}
+
+func TestConnectivity(ctx context.Context, req Request) (ConnectivityReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	transport, err := req.newTransportConfig()
+	if err != nil {
+		return ConnectivityReport{}, err
+	}
+	runtime := (*downloadRuntime)(nil)
+	if req.JSONOutput || req.EventObserver != nil {
+		runtime = newObservedDownloadRuntime(false, false, req.JSONOutput, nil, req.EventObserver)
+	}
+	return testConnectivityWithTransport(ctx, transport, runtime, scanProbeURL)
 }
 
 func DownloadWithObserver(ctx context.Context, req Request, observer ProgressObserver) error {
@@ -122,10 +156,12 @@ func (req Request) newPara(ctx context.Context, observer ProgressObserver) (*par
 		Ext:                   req.Extension,
 		Filename:              req.Filename,
 		InputtedMimeType:      append([]string(nil), req.MimeTypes...),
+		JSONOutput:            req.JSONOutput,
 		MaxConcurrency:        concurrency,
 		Notcreatetopdirectory: req.NotCreateTopDirectory,
 		OverWrite:             req.Overwrite,
 		Resumabledownload:     req.ResumableDownload,
+		Scan:                  req.Scan,
 		ShowFileInf:           req.ShowFileInfo,
 		Skip:                  req.Skip,
 		SkipError:             req.SkipError,
@@ -134,8 +170,8 @@ func (req Request) newPara(ctx context.Context, observer ProgressObserver) (*par
 		WorkDir:               workDir,
 		ExitReport:            req.ExitReport,
 	}
-	if observer != nil || req.ShowTerminalProgress || req.ExitReport || concurrency > 1 {
-		p.Runtime = newObservedDownloadRuntime(req.ShowTerminalProgress, req.ExitReport, observer)
+	if observer != nil || req.ShowTerminalProgress || req.ExitReport || concurrency > 1 || req.EventObserver != nil || req.JSONOutput {
+		p.Runtime = newObservedDownloadRuntime(req.ShowTerminalProgress, req.ExitReport, req.JSONOutput, observer, req.EventObserver)
 	}
 	return p, append([]string(nil), req.URLs...), nil
 }
@@ -145,24 +181,37 @@ func (req Request) newTransportConfig() (transportConfig, error) {
 	if err != nil {
 		return transportConfig{}, err
 	}
-	profileName, profileID, err := parseUTLSProfile(req.UTLSProfile)
+	profiles, err := parseUTLSProfileList(req.UTLSProfile)
 	if err != nil {
 		return transportConfig{}, err
 	}
-	resolveTo, err := parseResolveTo(req.ResolveTo)
+	profileName := profiles[0].name
+	profileID := profiles[0].id
+	resolveToAddrs, err := parseResolveToList(req.ResolveTo)
 	if err != nil {
 		return transportConfig{}, err
+	}
+	resolveTo := ""
+	if len(resolveToAddrs) > 0 {
+		resolveTo = resolveToAddrs[0]
 	}
 	fronting := frontingConfig{}
 	if req.FrontingEnable {
-		if req.FrontingTarget == "" {
+		targets := splitCommaSeparated([]string{req.FrontingTarget})
+		if len(targets) == 0 {
 			return transportConfig{}, fmt.Errorf("FrontingTarget is required when FrontingEnable is true")
 		}
-		target, err := parseHostnameValue(req.FrontingTarget, "FrontingTarget")
-		if err != nil {
-			return transportConfig{}, err
+		normalizedTargets := make([]string, 0, len(targets))
+		for _, rawTarget := range targets {
+			target, err := parseHostnameValue(rawTarget, "FrontingTarget")
+			if err != nil {
+				return transportConfig{}, err
+			}
+			normalizedTargets = append(normalizedTargets, target)
 		}
+		target := normalizedTargets[0]
 		sni := req.FrontingSNI
+		explicitSNI := strings.TrimSpace(sni) != ""
 		if sni == "" {
 			sni = target
 		} else {
@@ -171,10 +220,15 @@ func (req Request) newTransportConfig() (transportConfig, error) {
 				return transportConfig{}, err
 			}
 		}
-		fronting = frontingConfig{Enable: true, Target: target, SNI: sni}
+		fronting = frontingConfig{Enable: true, Target: target, Targets: normalizedTargets, SNI: sni, explicitSNI: explicitSNI}
+	} else if strings.TrimSpace(req.FrontingTarget) != "" || strings.TrimSpace(req.FrontingSNI) != "" {
+		return transportConfig{}, fmt.Errorf("FrontingTarget and FrontingSNI require FrontingEnable")
 	}
 	if req.Timeout < 0 {
 		return transportConfig{}, fmt.Errorf("Timeout must be greater than or equal to 0")
+	}
+	if req.RetryCount < 0 {
+		return transportConfig{}, fmt.Errorf("RetryCount must be greater than or equal to 0")
 	}
 	if req.RequestDelay < 0 {
 		return transportConfig{}, fmt.Errorf("RequestDelay must be greater than or equal to 0")
@@ -195,12 +249,16 @@ func (req Request) newTransportConfig() (transportConfig, error) {
 		ForceHTTP1:      req.ForceHTTP1,
 		PreferHTTP2:     req.PreferHTTP2,
 		Proxy:           proxyURL,
+		RetryCount:      req.RetryCount,
 		RequestDelay:    req.RequestDelay,
 		ResolveTo:       resolveTo,
+		ResolveToAddrs:  resolveToAddrs,
+		Scan:            req.Scan,
 		ShareHTTP2Conn:  req.ShareHTTP2Conn,
 		Timeout:         req.Timeout,
 		UTLSProfile:     profileID,
 		UTLSProfileName: profileName,
+		UTLSProfiles:    profiles,
 		Verbosity:       req.Verbosity,
 		sharedState:     newTransportSharedState(),
 	}, nil

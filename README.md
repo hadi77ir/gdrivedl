@@ -1,5 +1,7 @@
 # gdrivedl
 
+English | [فارسی](README.fa.md)
+
 `gdrivedl` is a Go library and CLI for downloading shared Google Drive files and folders.
 
 It supports:
@@ -13,6 +15,8 @@ It supports:
 - Optional exit reports with per-file completion status
 - Optional per-file completion reports after successful downloads
 - Optional dry-run request testing without saving files
+- Optional connectivity scanning with reusable fronting targets, IPs, and `uTLS` profiles
+- Structured event output with timestamps for GUI integrations and JSON-mode CLI use
 - Configurable HTTP timeout and verbosity-controlled transport logs
 - Configurable delay between HTTP requests
 - Optional HTTP request and response header dumps
@@ -50,6 +54,8 @@ err := gdrivedl.Download(ctx, gdrivedl.Request{
 
 For UI integrations, use `gdrivedl.DownloadWithObserver` to receive periodic task snapshots and aggregate progress updates.
 
+For richer integrations, set `gdrivedl.Request.EventObserver` to receive timestamped `Event` records for logs, progress updates, and reports.
+
 ## API Key
 
 Public shared folder downloads do not require a Google Drive API key.
@@ -57,7 +63,7 @@ API keys are still used for resumable downloads and Drive API metadata lookups.
 
 `gdrivedl` reads the key from:
 
-- `--apikey`
+- `--api-key`
 - `GDRIVEDL_APIKEY`
 - `GOODLS_APIKEY` as a legacy fallback
 
@@ -72,77 +78,233 @@ export GDRIVEDL_APIKEY='your-api-key'
 Download a shared file:
 
 ```bash
-gdrivedl -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+gdrivedl get -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
 ```
 
-Note:
-
-- Shared-link downloads must be publicly accessible without an interactive Google sign-in.
+Shared-link downloads must be publicly accessible without an interactive Google sign-in.
 
 Download a Google Docs file as plain text:
 
 ```bash
-gdrivedl -u 'https://docs.google.com/document/d/FILE_ID/edit?usp=sharing' -e txt
+gdrivedl get -u 'https://docs.google.com/document/d/FILE_ID/edit?usp=sharing' -e txt
 ```
 
 Download a public shared folder without an API key:
 
 ```bash
-gdrivedl -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing'
+gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing'
 ```
 
 Download a shared folder with an API key:
 
 ```bash
-gdrivedl -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' -key "$GDRIVEDL_APIKEY"
+gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' --api-key "$GDRIVEDL_APIKEY"
 ```
 
 Show folder metadata/listing without an API key:
 
 ```bash
-gdrivedl -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' -i
+gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' --file-info
 ```
 
 Show file metadata with an API key:
 
 ```bash
-gdrivedl -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' -key "$GDRIVEDL_APIKEY" -i
+gdrivedl get -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' --api-key "$GDRIVEDL_APIKEY" --file-info
 ```
 
 Run a resumable download:
 
 ```bash
-gdrivedl -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' -key "$GDRIVEDL_APIKEY" -r 100m
+gdrivedl get -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' --api-key "$GDRIVEDL_APIKEY" --resumable-download 100m
 ```
+
+Resume a folder download and keep already completed files:
+
+```bash
+gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' --api-key "$GDRIVEDL_APIKEY" --resumable-download 100m
+```
+
+- Completed files are kept and skipped.
+- Partial files are resumed when range downloads are supported.
+- If a file cannot be resumed, `gdrivedl` preserves the partial file temporarily and re-downloads that file from the beginning instead of failing the whole folder resume path.
+- Pressing `Ctrl+C` cancels the current job through the shared context, keeps the closest safe partial state on disk, and lets you rerun later with `-r` to continue from the nearest possible point.
 
 Test a download request without writing any files:
 
 ```bash
-gdrivedl --dry-run -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+gdrivedl get --dry-run -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+```
+
+Emit structured JSON events instead of plain log lines:
+
+```bash
+gdrivedl get --json -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
 ```
 
 Download multiple URLs from a file:
 
 ```bash
-gdrivedl --url-list urls.txt
+gdrivedl get --url-list urls.txt
 ```
 
 Download multiple URLs from standard input:
 
 ```bash
-cat urls.txt | gdrivedl --url-list -
+cat urls.txt | gdrivedl get --url-list -
 ```
 
 Download a list concurrently with progress and an exit report:
 
 ```bash
-gdrivedl \
+gdrivedl get \
   --url-list urls.txt \
   --concurrency 4 \
   --progress \
   --exit-report \
   --proxy 'http://127.0.0.1:2089'
 ```
+
+## Scan And Test
+
+Probe viable direct and fronted routes with the standalone scanner:
+
+```bash
+gdrivedl scan
+```
+
+Run only the IP-discovery phase:
+
+```bash
+gdrivedl scan --scan-mode only-ip
+```
+
+Run only the domain/SNI phase against previously discovered IPs:
+
+```bash
+gdrivedl scan \
+  --scan-mode only-domains \
+  --resolve-to 203.0.113.10,203.0.113.11 \
+  --fronting-target google.com \
+  --fronting-sni www.google.com
+```
+
+Add extra candidate domains from a file or from standard input:
+
+```bash
+gdrivedl scan --scan-domain-list extra-domains.txt
+cat extra-domains.txt | gdrivedl scan --scan-domain-list -
+```
+
+Add extra IPs or IPv4 CIDR ranges, or sample a few random IPs from each CIDR:
+
+```bash
+gdrivedl scan --scan-ip-list extra-ips.txt --scan-ip-random-count 16
+```
+
+Send one transport probe without starting a download:
+
+```bash
+gdrivedl test --fronting-enable --fronting-target google.com --utls-profile firefox_auto
+```
+
+Save reusable scan results into a YAML config file, merging into it when it already exists:
+
+```bash
+gdrivedl scan --save gdrivedl.yml
+```
+
+The scanner probes `https://gstatic.com/generate_204` and reports reusable values for:
+
+- `--fronting-target`
+- `--fronting-sni`
+- `--resolve-to`
+- `--utls-profile`
+
+`--scan-mode full` runs both phases sequentially. `--scan-mode only-ip` scans DNS results, configured `--resolve-to` values, and IP ranges. `--scan-mode only-domains` skips DNS/IP discovery and probes fronting targets plus any extra `--fronting-sni` hostnames against the supplied `--resolve-to` IP list.
+
+`--save` writes the scan results back into a YAML config file. It preserves unrelated sections such as `defaults`, `get`, and `merge`, while updating reusable `transport` and `scan` values such as `fronting-target`, `fronting-sni`, `resolve-to`, and `utls-profile`.
+
+It loads candidate subdomains from `assets/google-subdomains.txt` when present, falls back to the embedded list otherwise, and can extend the list with `--scan-domain-list`. It also loads Google IPs and CIDR ranges from `assets/google-ips.txt` and can extend those with `--scan-ip-list`.
+
+## Merge
+
+Merge chunk files from the current folder into one output file:
+
+```bash
+gdrivedl merge -o merged.bin
+```
+
+Merge multiple `split_nnnn` folders into one output file:
+
+```bash
+gdrivedl merge -o merged.bin split_0001 split_0002 split_0003
+```
+
+Merge from a parent folder containing `split_nnnn` subfolders:
+
+```bash
+gdrivedl merge -o merged.bin ./download-parts
+```
+
+Delete chunks only after a successful safe merge completes:
+
+```bash
+gdrivedl merge -o merged.bin --delete-chunks ./download-parts
+```
+
+Use the older streaming mode that writes directly to the final output and deletes chunks as it goes:
+
+```bash
+gdrivedl merge -o merged.bin --unsafe ./download-parts
+```
+
+Notes:
+
+- `gdrivedl merge` uses safe mode by default: it writes to a temporary output first, renames it into place after success, and keeps source chunks unless `--delete-chunks` is set.
+- `gdrivedl merge --unsafe` restores the old direct-write behavior and deletes chunks while merging, but cancellation is not supported in that mode.
+
+## YAML Config
+
+Each subcommand accepts `--config`.
+
+- Default path: `$XDG_CONFIG_DIR/gdrivedl.yml`
+- Fallback path: `$XDG_CONFIG_HOME/gdrivedl.yml`, then the user config directory's `gdrivedl.yml`
+- Disable loading explicitly: `--config ''`
+
+Example:
+
+```yaml
+defaults:
+  json: false
+
+transport:
+  proxy: http://127.0.0.1:2089
+  timeout: 45s
+  retry-count: 2
+  verbosity: 1
+
+get:
+  progress: true
+  concurrency: 4
+  directory: /tmp/downloads
+  api-key: your-api-key
+  fronting-enable: true
+  fronting-target: google.com
+  utls-profile: firefox_auto,chrome_auto
+
+scan:
+  scan-mode: full
+  fronting-enable: true
+  fronting-target: google.com
+  scan-ip-random-count: 16
+
+merge:
+  progress: true
+  delete-chunks: false
+```
+
+Config files intentionally do not accept one-shot CLI inputs such as `url`, `url-list`, `help`, `version`, or merge input arguments.
 
 ## Progress And Reporting
 
@@ -164,15 +326,33 @@ gdrivedl \
 
 - Prints a per-file completion line after each successful download.
 
+`--json`
+
+- Emits one JSON object per line.
+- Includes timestamped `log`, `progress`, and `report` events.
+- Makes CLI output easier to consume from GUI wrappers and automation.
+
+`--no-json`
+
+- Disables JSON event output even when `json: true` comes from config.
+
 `--dry-run`
 
 - Sends the download request without saving the response body to disk.
 - Does not create files or directories.
 - Useful for testing connectivity, request routing, and remote accessibility.
 
+Common negative overrides:
+
+- `--no-progress` disables both aggregate progress and the legacy single-file progress bar.
+- `--no-exit-report` and `--no-completion-report` disable report output inherited from config.
+- `--no-fronting`, `--no-prefer-http2`, and `--no-force-http1` disable transport booleans inherited from config.
+- `--safe` disables merge `unsafe` mode inherited from config.
+- `--keep-chunks` disables merge `delete-chunks` inherited from config.
+
 Notes:
 
-- `--progress` cannot be combined with `--NoProgress`.
+- `--progress` cannot be combined with `--no-progress`.
 - `--concurrency` must be greater than `0`.
 
 ## HTTP Logging
@@ -218,7 +398,7 @@ Connection stages include examples such as:
 Example:
 
 ```bash
-gdrivedl \
+gdrivedl get \
   --progress \
   --verbosity 2 \
   --timeout 45s \
@@ -243,7 +423,21 @@ Supported schemes:
 Example HTTP proxy:
 
 ```bash
-gdrivedl --proxy 'http://127.0.0.1:2089' -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+gdrivedl get --proxy 'http://127.0.0.1:2089' -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+```
+
+### `--retry-count`
+
+Set how many times `gdrivedl` retries after the initial request attempt.
+
+- Retries transient network failures.
+- Retries HTTP `408`, `425`, `429`, `500`, `502`, `503`, and `504` responses.
+- Defaults to `0`.
+
+Example:
+
+```bash
+gdrivedl get --retry-count 2 --proxy 'http://127.0.0.1:2089' -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
 ```
 
 ### `uTLS`
@@ -267,8 +461,10 @@ Supported values:
 
 Example:
 
+`--utls-profile` accepts one profile or a comma-separated list used in round-robin order.
+
 ```bash
-gdrivedl --utls-profile firefox_auto -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+gdrivedl get --utls-profile 'firefox_auto,chrome_auto' -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
 ```
 
 ### HTTP Version Selection
@@ -293,7 +489,7 @@ gdrivedl --utls-profile firefox_auto -u 'https://drive.google.com/file/d/FILE_ID
 Example:
 
 ```bash
-gdrivedl \
+gdrivedl get \
   --prefer-http2 \
   --share-http2-connection \
   --utls-profile chrome_auto \
@@ -305,10 +501,12 @@ gdrivedl \
 
 Override the network dial IP while preserving the original request port and logical host.
 
+You can pass a comma-separated list of IPs. Requests select from that list in round-robin order.
+
 Example:
 
 ```bash
-gdrivedl --resolve-to 203.0.113.10 -u 'https://www.googleapis.com/drive/v3/files/FILE_ID?alt=media'
+gdrivedl get --resolve-to 203.0.113.10 -u 'https://www.googleapis.com/drive/v3/files/FILE_ID?alt=media'
 ```
 
 ### Domain Fronting
@@ -321,6 +519,7 @@ gdrivedl --resolve-to 203.0.113.10 -u 'https://www.googleapis.com/drive/v3/files
 
 - Fronting target hostname used for network dial.
 - The original request port is preserved.
+- Accepts a comma-separated list of hostnames and rotates through them in round-robin order.
 - Requires `--fronting-enable`.
 
 `--fronting-sni`
@@ -332,7 +531,7 @@ gdrivedl --resolve-to 203.0.113.10 -u 'https://www.googleapis.com/drive/v3/files
 Example:
 
 ```bash
-gdrivedl \
+gdrivedl get \
   --fronting-enable \
   --fronting-target front.example.com \
   --fronting-sni front.example.com \
@@ -352,4 +551,10 @@ gdrivedl \
 
 ```bash
 gdrivedl --help
+gdrivedl help get
+gdrivedl help scan
 ```
+
+## Final Note
+
+This codebase has been developed with the help of AI assistants, including Codex and GPT-5.4.
