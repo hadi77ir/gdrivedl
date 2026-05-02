@@ -87,10 +87,10 @@ func TestRunConnectivityScan(t *testing.T) {
 		loadDefaultIPSpecs: func() ([]string, error) {
 			return []string{"198.51.100.20/31"}, nil
 		},
-		resolveLocal: func(context.Context, string) ([]string, error) {
+		resolveLocal: func(context.Context, string, *downloadRuntime) ([]string, error) {
 			return []string{"203.0.113.10"}, nil
 		},
-		resolveRemote: func(context.Context, string) ([]string, error) {
+		resolveRemote: func(context.Context, string, *downloadRuntime) ([]string, error) {
 			return []string{"203.0.113.11"}, nil
 		},
 		dial: func(_ context.Context, _ transportConfig, ip string) error {
@@ -101,7 +101,7 @@ func TestRunConnectivityScan(t *testing.T) {
 				return errors.New("dial fail")
 			}
 		},
-		probe: func(_ context.Context, cfg transportConfig) error {
+		probe: func(_ context.Context, cfg transportConfig, _ *downloadRuntime) error {
 			if !cfg.Fronting.Enable {
 				if cfg.UTLSProfileName == "firefox_auto" {
 					return nil
@@ -115,7 +115,7 @@ func TestRunConnectivityScan(t *testing.T) {
 			return errors.New("fronting fail")
 		},
 	}
-	report, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{Mode: scanModeFull}, deps)
+	report, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{Mode: scanModeFull}, nil, deps)
 	if err != nil {
 		t.Fatalf("runConnectivityScan() error = %v", err)
 	}
@@ -181,17 +181,17 @@ func TestRunConnectivityScanSamplesCIDRInputs(t *testing.T) {
 	deps := scanDependencies{
 		loadDefaultDomains: func() ([]string, error) { return []string{"scan.example.com"}, nil },
 		loadDefaultIPSpecs: func() ([]string, error) { return []string{"198.51.100.0/30"}, nil },
-		resolveLocal:       func(context.Context, string) ([]string, error) { return nil, nil },
-		resolveRemote:      func(context.Context, string) ([]string, error) { return nil, nil },
+		resolveLocal:       func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		resolveRemote:      func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
 		dial:               func(context.Context, transportConfig, string) error { return nil },
-		probe: func(_ context.Context, cfg transportConfig) error {
+		probe: func(_ context.Context, cfg transportConfig, _ *downloadRuntime) error {
 			if !cfg.Fronting.Enable {
 				return nil
 			}
 			return errors.New("fronting fail")
 		},
 	}
-	report, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{Mode: scanModeFull}, deps)
+	report, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{Mode: scanModeFull}, nil, deps)
 	if err != nil {
 		t.Fatalf("runConnectivityScan() error = %v", err)
 	}
@@ -217,20 +217,20 @@ func TestRunConnectivityScanOnlyIPIncludesResolveTo(t *testing.T) {
 	deps := scanDependencies{
 		loadDefaultDomains: func() ([]string, error) { return nil, nil },
 		loadDefaultIPSpecs: func() ([]string, error) { return nil, nil },
-		resolveLocal:       func(context.Context, string) ([]string, error) { return nil, nil },
-		resolveRemote:      func(context.Context, string) ([]string, error) { return nil, nil },
+		resolveLocal:       func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		resolveRemote:      func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
 		dial: func(_ context.Context, _ transportConfig, ip string) error {
 			if ip == "203.0.113.99" {
 				return nil
 			}
 			return errors.New("dial fail")
 		},
-		probe: func(context.Context, transportConfig) error { return errors.New("direct fail") },
+		probe: func(context.Context, transportConfig, *downloadRuntime) error { return errors.New("direct fail") },
 	}
 	report, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{
 		Mode:           scanModeOnlyIP,
 		ResolveToAddrs: []string{"203.0.113.99"},
-	}, deps)
+	}, nil, deps)
 	if err != nil {
 		t.Fatalf("runConnectivityScan() error = %v", err)
 	}
@@ -255,11 +255,11 @@ func TestRunConnectivityScanOnlyDomainsIncludesFrontingSNI(t *testing.T) {
 	deps := scanDependencies{
 		loadDefaultDomains: func() ([]string, error) { return nil, nil },
 		loadDefaultIPSpecs: func() ([]string, error) { return nil, nil },
-		resolveLocal: func(context.Context, string) ([]string, error) {
+		resolveLocal: func(context.Context, string, *downloadRuntime) ([]string, error) {
 			localResolveCalls++
 			return nil, nil
 		},
-		resolveRemote: func(context.Context, string) ([]string, error) {
+		resolveRemote: func(context.Context, string, *downloadRuntime) ([]string, error) {
 			remoteResolveCalls++
 			return nil, nil
 		},
@@ -269,7 +269,7 @@ func TestRunConnectivityScanOnlyDomainsIncludesFrontingSNI(t *testing.T) {
 			}
 			return errors.New("dial fail")
 		},
-		probe: func(_ context.Context, cfg transportConfig) error {
+		probe: func(_ context.Context, cfg transportConfig, _ *downloadRuntime) error {
 			if cfg.Fronting.Target == "target.example.com" && cfg.Fronting.SNI == "sni.example.com" && cfg.ResolveTo == "203.0.113.42" {
 				return nil
 			}
@@ -281,7 +281,7 @@ func TestRunConnectivityScanOnlyDomainsIncludesFrontingSNI(t *testing.T) {
 		FrontingTargets: []string{"target.example.com"},
 		FrontingSNIs:    []string{"sni.example.com"},
 		ResolveToAddrs:  []string{"203.0.113.42"},
-	}, deps)
+	}, nil, deps)
 	if err != nil {
 		t.Fatalf("runConnectivityScan() error = %v", err)
 	}
@@ -302,6 +302,80 @@ func TestRunConnectivityScanOnlyDomainsIncludesFrontingSNI(t *testing.T) {
 	}
 	if !reflect.DeepEqual(report.Targets[0].ResolveToIPs, []string{"203.0.113.42"}) {
 		t.Fatalf("ResolveToIPs = %#v", report.Targets[0].ResolveToIPs)
+	}
+}
+
+func TestRunConnectivityScanCancelled(t *testing.T) {
+	base := transportConfig{UTLSProfiles: []utlsProfileOption{{name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deps := scanDependencies{
+		loadDefaultDomains: func() ([]string, error) { return []string{"scan.example.com"}, nil },
+		loadDefaultIPSpecs: func() ([]string, error) { return nil, nil },
+		resolveLocal: func(_ context.Context, _ string, _ *downloadRuntime) ([]string, error) {
+			cancel()
+			return nil, context.Canceled
+		},
+		resolveRemote: func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		probe:         func(context.Context, transportConfig, *downloadRuntime) error { return nil },
+		dial:          func(context.Context, transportConfig, string) error { return nil },
+	}
+
+	_, err := runConnectivityScan(ctx, base, connectivityScanOptions{Mode: scanModeFull}, nil, deps)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runConnectivityScan() error = %v, want context canceled", err)
+	}
+}
+
+func TestRunConnectivityScanEmitsProgressAndLogEvents(t *testing.T) {
+	base := transportConfig{UTLSProfiles: []utlsProfileOption{{name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]}}}
+	var events []Event
+	runtime := newObservedDownloadRuntime(false, false, true, nil, func(event Event) {
+		events = append(events, event)
+	})
+	deps := scanDependencies{
+		loadDefaultDomains: func() ([]string, error) { return nil, nil },
+		loadDefaultIPSpecs: func() ([]string, error) { return nil, nil },
+		resolveLocal:       func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		resolveRemote:      func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		probe:              func(context.Context, transportConfig, *downloadRuntime) error { return nil },
+		dial:               func(context.Context, transportConfig, string) error { return nil },
+	}
+
+	output := captureStdout(t, func() {
+		_, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{
+			Mode:           scanModeOnlyIP,
+			ResolveToAddrs: []string{"203.0.113.42"},
+		}, runtime, deps)
+		if err != nil {
+			t.Fatalf("runConnectivityScan() error = %v", err)
+		}
+	})
+	if !strings.Contains(output, "\"name\":\"scan\"") {
+		t.Fatalf("expected JSON scan events in output, got %q", output)
+	}
+	var sawProgress bool
+	var sawLog bool
+	var sawCompleted bool
+	for _, event := range events {
+		switch {
+		case event.Type == "progress" && event.Name == "scan":
+			sawProgress = true
+			if state, _ := event.Fields["state"].(string); state == "completed" {
+				sawCompleted = true
+			}
+		case event.Type == "log" && event.Name == "scan":
+			sawLog = true
+		}
+	}
+	if !sawProgress {
+		t.Fatalf("expected scan progress events, got %#v", events)
+	}
+	if !sawLog {
+		t.Fatalf("expected scan log events, got %#v", events)
+	}
+	if !sawCompleted {
+		t.Fatalf("expected completed scan progress event, got %#v", events)
 	}
 }
 

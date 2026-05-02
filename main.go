@@ -723,6 +723,10 @@ func handleScanCommand(c *cli.Context) error {
 			return err
 		}
 	}
+	var runtime *downloadRuntime
+	if options.JSONOutput || transport.Verbosity > 0 {
+		runtime = newObservedDownloadRuntime(false, false, options.JSONOutput, nil, nil)
+	}
 	report, scanErr := runConnectivityScan(commandContext(c), transport, connectivityScanOptions{
 		Mode:            options.ScanMode,
 		ExtraDomains:    extraScanDomains,
@@ -730,9 +734,8 @@ func handleScanCommand(c *cli.Context) error {
 		FrontingSNIs:    frontingSNIs,
 		FrontingTargets: frontingTargets,
 		ResolveToAddrs:  resolveToAddrs,
-	}, scanDependencies{})
+	}, runtime, scanDependencies{})
 	if options.JSONOutput {
-		runtime := newObservedDownloadRuntime(false, false, true, nil, nil)
 		runtime.report("scan", report.fields())
 	} else {
 		report.print(os.Stdout)

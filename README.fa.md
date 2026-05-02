@@ -221,6 +221,8 @@ gdrivedl scan --save gdrivedl.yml
 - `--resolve-to`
 - `--utls-profile`
 
+اجرای اسکن با `Ctrl+C` قابل لغو است. `--verbosity 1` لاگ زندهٔ فازها را نشان می‌دهد، `--verbosity 2` جزئیات مرحله‌به‌مرحله را اضافه می‌کند، و `--json` هنگام اجرای اسکن رویدادهای ساختاریافتهٔ timestampدار از نوع `log` و `progress` را خروجی می‌دهد.
+
 `--scan-mode full` هر دو فاز را به‌صورت ترتیبی اجرا می‌کند. `--scan-mode only-ip` نتایج DNS، مقادیر پیکربندی‌شدهٔ `--resolve-to` و بازه‌های IP را اسکن می‌کند. `--scan-mode only-domains` از کشف DNS/IP صرف‌نظر می‌کند و targetهای fronting را به‌همراه هر hostname اضافی در `--fronting-sni` روی فهرست IPهای داده‌شده در `--resolve-to` probe می‌کند.
 
 `--save` نتایج اسکن را دوباره در یک فایل پیکربندی YAML می‌نویسد. این گزینه بخش‌های نامرتبط مانند `defaults`، `get` و `merge` را حفظ می‌کند و در عین حال مقادیر قابل‌استفادهٔ مجدد در `transport` و `scan` مانند `fronting-target`، `fronting-sni`، `resolve-to` و `utls-profile` را به‌روزرسانی می‌کند.

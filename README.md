@@ -221,6 +221,8 @@ The scanner probes `https://gstatic.com/generate_204` and reports reusable value
 - `--resolve-to`
 - `--utls-profile`
 
+Scanner runs are cancellable with `Ctrl+C`. `--verbosity 1` shows phase-level live logs, `--verbosity 2` adds step-level details, and `--json` emits structured timestamped `log` and `progress` events while the scan is running.
+
 `--scan-mode full` runs both phases sequentially. `--scan-mode only-ip` scans DNS results, configured `--resolve-to` values, and IP ranges. `--scan-mode only-domains` skips DNS/IP discovery and probes fronting targets plus any extra `--fronting-sni` hostnames against the supplied `--resolve-to` IP list.
 
 `--save` writes the scan results back into a YAML config file. It preserves unrelated sections such as `defaults`, `get`, and `merge`, while updating reusable `transport` and `scan` values such as `fronting-target`, `fronting-sni`, `resolve-to`, and `utls-profile`.

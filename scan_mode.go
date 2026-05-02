@@ -87,8 +87,8 @@ type scanReport struct {
 	Targets           []scanTargetResult
 }
 
-type scanProbeFunc func(context.Context, transportConfig) error
-type scanResolveFunc func(context.Context, string) ([]string, error)
+type scanProbeFunc func(context.Context, transportConfig, *downloadRuntime) error
+type scanResolveFunc func(context.Context, string, *downloadRuntime) ([]string, error)
 type scanDialFunc func(context.Context, transportConfig, string) error
 type scanListFunc func() ([]string, error)
 
@@ -270,7 +270,7 @@ func defaultScanIPSpecLoader() ([]string, error) {
 	return readOptionalIPAsset(scanIPAssetPath)
 }
 
-func defaultScanResolver(ctx context.Context, host string) ([]string, error) {
+func defaultScanResolver(ctx context.Context, host string, _ *downloadRuntime) ([]string, error) {
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, err
@@ -287,7 +287,7 @@ func defaultScanResolver(ctx context.Context, host string) ([]string, error) {
 
 func defaultFrontedDNSResolver(base transportConfig) scanResolveFunc {
 	profiles := scanProfileCandidates(base)
-	return func(ctx context.Context, host string) ([]string, error) {
+	return func(ctx context.Context, host string, runtime *downloadRuntime) ([]string, error) {
 		cfg := base
 		cfg.Scan = false
 		cfg.disableUTLSFallback = false
@@ -314,6 +314,7 @@ func defaultFrontedDNSResolver(base transportConfig) scanResolveFunc {
 		if err != nil {
 			return nil, err
 		}
+		req = withRequestTrace(req, runtime, nil)
 		query := req.URL.Query()
 		query.Set("name", host)
 		query.Set("type", "A")
@@ -347,11 +348,11 @@ func defaultFrontedDNSResolver(base transportConfig) scanResolveFunc {
 	}
 }
 
-func defaultScanProbe(ctx context.Context, cfg transportConfig) error {
+func defaultScanProbe(ctx context.Context, cfg transportConfig, runtime *downloadRuntime) error {
 	probeCfg := cfg
 	probeCfg.Scan = false
 	probeCfg.disableUTLSFallback = true
-	_, err := testConnectivityWithTransport(ctx, probeCfg, nil, scanProbeURL)
+	_, err := testConnectivityWithTransport(ctx, probeCfg, runtime, scanProbeURL)
 	return err
 }
 
@@ -427,9 +428,16 @@ func expandIPSpecs(specs []string) ([]string, error) {
 }
 
 func expandIPSpecsWithSampling(specs []string, cidrSampleCount int) ([]string, error) {
+	return expandIPSpecsWithSamplingContext(context.Background(), specs, cidrSampleCount)
+}
+
+func expandIPSpecsWithSamplingContext(ctx context.Context, specs []string, cidrSampleCount int) ([]string, error) {
 	var out []string
 	for _, spec := range dedupeStrings(specs) {
-		expanded, err := expandIPSpecWithSampling(spec, cidrSampleCount)
+		if err := checkScanContext(ctx); err != nil {
+			return nil, err
+		}
+		expanded, err := expandIPSpecWithSamplingContext(ctx, spec, cidrSampleCount)
 		if err != nil {
 			return nil, err
 		}
@@ -443,6 +451,10 @@ func expandIPSpec(spec string) ([]string, error) {
 }
 
 func expandIPSpecWithSampling(spec string, cidrSampleCount int) ([]string, error) {
+	return expandIPSpecWithSamplingContext(context.Background(), spec, cidrSampleCount)
+}
+
+func expandIPSpecWithSamplingContext(ctx context.Context, spec string, cidrSampleCount int) ([]string, error) {
 	if ip := net.ParseIP(spec); ip != nil {
 		return []string{ip.String()}, nil
 	}
@@ -450,7 +462,7 @@ func expandIPSpecWithSampling(spec string, cidrSampleCount int) ([]string, error
 	if err != nil {
 		return nil, fmt.Errorf("scan IP list values must be an IP address or CIDR range")
 	}
-	return expandIPv4CIDRWithSampling(ipnet, cidrSampleCount)
+	return expandIPv4CIDRWithSamplingContext(ctx, ipnet, cidrSampleCount)
 }
 
 func expandIPv4CIDR(ipnet *net.IPNet) ([]string, error) {
@@ -458,6 +470,10 @@ func expandIPv4CIDR(ipnet *net.IPNet) ([]string, error) {
 }
 
 func expandIPv4CIDRWithSampling(ipnet *net.IPNet, cidrSampleCount int) ([]string, error) {
+	return expandIPv4CIDRWithSamplingContext(context.Background(), ipnet, cidrSampleCount)
+}
+
+func expandIPv4CIDRWithSamplingContext(ctx context.Context, ipnet *net.IPNet, cidrSampleCount int) ([]string, error) {
 	base := ipnet.IP.To4()
 	if base == nil {
 		return nil, fmt.Errorf("scan IP ranges only support IPv4 CIDR values")
@@ -472,26 +488,36 @@ func expandIPv4CIDRWithSampling(ipnet *net.IPNet, cidrSampleCount int) ([]string
 			if hostCount > scanMaxCIDRHostCount {
 				return nil, fmt.Errorf("scan IP range %q contains %d addresses; lower --scan-ip-random-count or split it into smaller CIDRs", ipnet.String(), hostCount)
 			}
-			return expandIPv4Range(base, hostCount), nil
+			return expandIPv4RangeContext(ctx, base, hostCount)
 		}
 		return sampleIPv4Range(base, hostCount, cidrSampleCount), nil
 	}
 	if hostCount > scanMaxCIDRHostCount {
 		return nil, fmt.Errorf("scan IP range %q expands to %d addresses; split it into smaller CIDRs", ipnet.String(), hostCount)
 	}
-	return expandIPv4Range(base, hostCount), nil
+	return expandIPv4RangeContext(ctx, base, hostCount)
 }
 
 func expandIPv4Range(base net.IP, hostCount uint64) []string {
+	out, _ := expandIPv4RangeContext(context.Background(), base, hostCount)
+	return out
+}
+
+func expandIPv4RangeContext(ctx context.Context, base net.IP, hostCount uint64) ([]string, error) {
 	start := binary.BigEndian.Uint32(base)
 	out := make([]string, 0, int(hostCount))
 	for offset := uint64(0); offset < hostCount; offset++ {
+		if offset%1024 == 0 {
+			if err := checkScanContext(ctx); err != nil {
+				return nil, err
+			}
+		}
 		ipValue := start + uint32(offset)
 		ipBytes := make([]byte, 4)
 		binary.BigEndian.PutUint32(ipBytes, ipValue)
 		out = append(out, net.IP(ipBytes).String())
 	}
-	return out
+	return out, nil
 }
 
 func sampleIPv4Range(base net.IP, hostCount uint64, sampleCount int) []string {
@@ -525,13 +551,25 @@ func sampleIPv4Range(base net.IP, hostCount uint64, sampleCount int) []string {
 	return out
 }
 
-func runConnectivityScan(ctx context.Context, base transportConfig, options connectivityScanOptions, deps scanDependencies) (scanReport, error) {
+func runConnectivityScan(ctx context.Context, base transportConfig, options connectivityScanOptions, runtime *downloadRuntime, deps scanDependencies) (report scanReport, scanErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deps = deps.withDefaults(base)
 	mode := options.Mode
 	if mode == "" {
 		mode = scanModeFull
 	}
-	report := scanReport{ProbeURL: scanProbeURL, Mode: string(mode)}
+	report = scanReport{ProbeURL: scanProbeURL, Mode: string(mode)}
+	observer := newScanObserver(runtime, mode, base.Verbosity)
+	defer func() {
+		observer.finish(scanErr)
+	}()
+	observer.beginPhase("setup")
+	observer.update("loading defaults", "loading scan candidates")
+	if err := checkScanContext(ctx); err != nil {
+		return report, err
+	}
 	defaultDomains, err := deps.loadDefaultDomains()
 	if err != nil {
 		return report, err
@@ -543,7 +581,12 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 	profiles := scanProfileCandidates(base)
 	domains := scanCandidateDomains(defaultDomains, options.FrontingTargets, options.ExtraDomains)
 	snis := scanCandidateSNIs(domains, options.FrontingSNIs)
+	observer.addTotal(int64(len(profiles)))
+	observer.beginPhase("direct_probe")
 	for _, profile := range profiles {
+		if err := checkScanContext(ctx); err != nil {
+			return report, err
+		}
 		cfg := base
 		cfg.Scan = false
 		cfg.disableUTLSFallback = true
@@ -553,10 +596,14 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 		cfg.UTLSProfileName = profile.name
 		cfg.UTLSProfile = profile.id
 		cfg.UTLSProfiles = []utlsProfileOption{profile}
-		if err := deps.probe(ctx, cfg); err == nil {
+		observer.update("probing", fmt.Sprintf("direct profile=%s", profile.name))
+		if err := deps.probe(ctx, cfg, runtime); err == nil {
 			report.DirectProfiles = append(report.DirectProfiles, profile.name)
 			report.UTLSProfiles = append(report.UTLSProfiles, profile.name)
+		} else if isCancellationError(err) {
+			return report, err
 		}
+		observer.complete()
 	}
 	targetResults := map[string]*scanTargetResult{}
 	getTarget := func(domain string) *scanTargetResult {
@@ -570,49 +617,96 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 	dialSources := make([]scanIPSourceResult, 0, len(domains)*2+2)
 	switch mode {
 	case scanModeFull, scanModeOnlyIP:
+		observer.addTotal(int64(len(domains) * 2))
+		observer.beginPhase("local_dns")
 		for _, domain := range domains {
+			if err := checkScanContext(ctx); err != nil {
+				return report, err
+			}
 			result := getTarget(domain)
-			ips, err := deps.resolveLocal(ctx, domain)
+			observer.update("resolving", fmt.Sprintf("local dns host=%s", domain))
+			ips, err := deps.resolveLocal(ctx, domain, runtime)
+			if isCancellationError(err) {
+				return report, err
+			}
 			if err == nil {
 				result.LocalDNSIPs = dedupeStrings(ips)
 			}
 			dialSources = append(dialSources, scanIPSourceResult{Source: "local_dns", Target: domain, CandidateIPs: result.LocalDNSIPs})
+			observer.complete()
 		}
+		observer.beginPhase("remote_dns")
 		for _, domain := range domains {
+			if err := checkScanContext(ctx); err != nil {
+				return report, err
+			}
 			result := getTarget(domain)
-			ips, err := deps.resolveRemote(ctx, domain)
+			observer.update("resolving", fmt.Sprintf("remote dns host=%s", domain))
+			ips, err := deps.resolveRemote(ctx, domain, runtime)
+			if isCancellationError(err) {
+				return report, err
+			}
 			if err == nil {
 				result.RemoteDNSIPs = dedupeStrings(ips)
 			}
 			dialSources = append(dialSources, scanIPSourceResult{Source: "remote_dns", Target: domain, CandidateIPs: result.RemoteDNSIPs})
+			observer.complete()
 		}
 		if len(options.ResolveToAddrs) > 0 {
 			dialSources = append(dialSources, scanIPSourceResult{Source: "resolve_to", CandidateIPs: dedupeStrings(options.ResolveToAddrs)})
 		}
-		rangeIPs, err := expandIPSpecsWithSampling(scanCandidateIPSpecs(defaultIPSpecs, options.ExtraIPSpecs), base.ScanIPRandomCount)
+		observer.addTotal(1)
+		observer.beginPhase("expand_ip_ranges")
+		observer.update("expanding", "expanding IP ranges")
+		rangeIPs, err := expandIPSpecsWithSamplingContext(ctx, scanCandidateIPSpecs(defaultIPSpecs, options.ExtraIPSpecs), base.ScanIPRandomCount)
+		if isCancellationError(err) {
+			return report, err
+		}
 		if err != nil {
 			return report, err
 		}
+		observer.complete()
 		if len(rangeIPs) > 0 {
 			dialSources = append(dialSources, scanIPSourceResult{Source: "ip_ranges", CandidateIPs: rangeIPs})
 		}
 	case scanModeOnlyDomains:
 		if len(options.ResolveToAddrs) == 0 {
-			return report, fmt.Errorf("--resolve-to is required when --scan-mode only-domains is used")
+			err := fmt.Errorf("--resolve-to is required when --scan-mode only-domains is used")
+			return report, err
 		}
 		dialSources = append(dialSources, scanIPSourceResult{Source: "resolve_to", CandidateIPs: dedupeStrings(options.ResolveToAddrs)})
 	default:
-		return report, fmt.Errorf("unsupported scan mode %q", mode)
+		err := fmt.Errorf("unsupported scan mode %q", mode)
+		return report, err
 	}
 	dialResults := make([]scanIPSourceResult, 0, len(dialSources))
 	dialCache := map[string]bool{}
 	var dialAccessible []string
+	var totalDialCandidates int64
 	for _, source := range dialSources {
+		totalDialCandidates += int64(len(dedupeStrings(source.CandidateIPs)))
+	}
+	observer.addTotal(totalDialCandidates)
+	observer.beginPhase("dial")
+	for _, source := range dialSources {
+		if err := checkScanContext(ctx); err != nil {
+			return report, err
+		}
 		source.CandidateIPs = dedupeStrings(source.CandidateIPs)
 		if len(source.CandidateIPs) == 0 {
 			continue
 		}
 		for _, ip := range source.CandidateIPs {
+			if err := checkScanContext(ctx); err != nil {
+				return report, err
+			}
+			current := ip
+			if source.Target != "" {
+				current = fmt.Sprintf("source=%s target=%s ip=%s", source.Source, source.Target, ip)
+			} else {
+				current = fmt.Sprintf("source=%s ip=%s", source.Source, ip)
+			}
+			observer.update("dialing", current)
 			worked, seen := dialCache[ip]
 			if !seen {
 				worked = deps.dial(ctx, base, ip) == nil
@@ -622,6 +716,7 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 				source.AccessibleIPs = append(source.AccessibleIPs, ip)
 				dialAccessible = append(dialAccessible, ip)
 			}
+			observer.complete()
 		}
 		source.AccessibleIPs = dedupeStrings(source.AccessibleIPs)
 		dialResults = append(dialResults, source)
@@ -629,12 +724,26 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 	report.DialSources = dialResults
 	report.DialAccessibleIPs = dedupeStrings(dialAccessible)
 	if mode != scanModeOnlyIP {
+		observer.addTotal(int64(len(domains) * len(report.DialAccessibleIPs) * len(snis) * len(profiles)))
+		observer.beginPhase("fronting_probe")
 		for _, domain := range domains {
+			if err := checkScanContext(ctx); err != nil {
+				return report, err
+			}
 			result := getTarget(domain)
 			for _, ip := range report.DialAccessibleIPs {
+				if err := checkScanContext(ctx); err != nil {
+					return report, err
+				}
 				ipWorked := false
 				for _, sni := range snis {
+					if err := checkScanContext(ctx); err != nil {
+						return report, err
+					}
 					for _, profile := range profiles {
+						if err := checkScanContext(ctx); err != nil {
+							return report, err
+						}
 						cfg := base
 						cfg.Scan = false
 						cfg.disableUTLSFallback = true
@@ -644,7 +753,12 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 						cfg.UTLSProfileName = profile.name
 						cfg.UTLSProfile = profile.id
 						cfg.UTLSProfiles = []utlsProfileOption{profile}
-						if err := deps.probe(ctx, cfg); err != nil {
+						observer.update("probing", fmt.Sprintf("target=%s sni=%s ip=%s profile=%s", domain, sni, ip, profile.name))
+						if err := deps.probe(ctx, cfg, runtime); err != nil {
+							if isCancellationError(err) {
+								return report, err
+							}
+							observer.complete()
 							continue
 						}
 						result.Profiles = append(result.Profiles, profile.name)
@@ -652,6 +766,7 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 						report.UTLSProfiles = append(report.UTLSProfiles, profile.name)
 						report.FrontingSNIs = append(report.FrontingSNIs, sni)
 						ipWorked = true
+						observer.complete()
 					}
 				}
 				if ipWorked {
@@ -676,9 +791,17 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 	report.ResolveToAddrs = dedupeStrings(report.ResolveToAddrs)
 	report.UTLSProfiles = dedupeStrings(report.UTLSProfiles)
 	if len(report.DirectProfiles) == 0 && len(report.DialAccessibleIPs) == 0 && len(report.FrontingTargets) == 0 {
-		return report, fmt.Errorf("scan found no viable direct, IP, or fronted routes")
+		err := fmt.Errorf("scan found no viable direct, IP, or fronted routes")
+		return report, err
 	}
 	return report, nil
+}
+
+func checkScanContext(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 func testConnectivityWithTransport(ctx context.Context, cfg transportConfig, runtime *downloadRuntime, probeURL string) (ConnectivityReport, error) {
