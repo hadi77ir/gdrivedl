@@ -52,6 +52,7 @@ type para struct {
 	DlFolder              bool
 	DownloadBytes         int64
 	DryRun                bool
+	EnableRedownload      bool
 	EnableProgress        bool
 	Ext                   string
 	ExitReport            bool
@@ -267,6 +268,9 @@ func (p *para) saveFile(res *http.Response) (err error) {
 	if err = p.getFilename(res); err != nil {
 		return err
 	}
+	if p.skipFolderSaveByResponseSize(res) {
+		return nil
+	}
 	if p.Task != nil {
 		p.Task.SetName(p.Filename)
 		switch {
@@ -332,6 +336,30 @@ func (p *para) saveFile(res *http.Response) (err error) {
 		p.printf("Completed: %s | Type: %s | MimeType: %s | FileSize: %d\n", p.Filename, p.Kind, p.ContentType, fileInfo.Size())
 	}
 	return nil
+}
+
+func (p *para) skipFolderSaveByResponseSize(res *http.Response) bool {
+	if p == nil || !p.DlFolder || p.DownloadBytes != -1 || p.shouldRedownloadCompletedFolderFile() || res == nil || res.ContentLength <= 0 {
+		return false
+	}
+	path := filepath.Join(p.WorkDir, p.Filename)
+	info, err := os.Stat(path)
+	if err != nil || info.Size() != res.ContentLength {
+		return false
+	}
+	if p.Task != nil {
+		p.Task.SetName(p.Filename)
+	}
+	state := folderLocalFileState{
+		Path:       path,
+		Exists:     true,
+		Complete:   true,
+		LocalSize:  info.Size(),
+		RemoteSize: res.ContentLength,
+	}
+	p.statusf("Keeping existing completed file: %s", state.Path)
+	p.markFolderFileAlreadyComplete(state)
+	return true
 }
 
 func (p *para) completeDryRun(res *http.Response) error {
@@ -729,6 +757,7 @@ func handleScanCommand(c *cli.Context) error {
 	}
 	report, scanErr := runConnectivityScan(commandContext(c), transport, connectivityScanOptions{
 		Mode:            options.ScanMode,
+		Concurrency:     options.ScanConcurrency,
 		ExtraDomains:    extraScanDomains,
 		ExtraIPSpecs:    extraScanIPs,
 		FrontingSNIs:    frontingSNIs,
@@ -755,6 +784,7 @@ func handleMergeCommand(c *cli.Context) error {
 	}
 	return Merge(commandContext(c), MergeRequest{
 		DeleteChunks:         options.DeleteChunks,
+		DryRun:               options.DryRun,
 		Inputs:               options.Inputs,
 		Output:               options.Output,
 		Overwrite:            options.Overwrite,
@@ -908,7 +938,7 @@ func createHelp() *cli.App {
 			Name:        "scan",
 			Usage:       "Probe viable direct and fronted transport routes.",
 			UsageText:   "gdrivedl scan [options]",
-			Description: "Probe https://gstatic.com/generate_204 in selectable phases. 'full' runs IP discovery first and then fronting-domain/SNI probing, 'only-ip' scans accessible IPs, and 'only-domains' validates fronting targets and SNIs against the provided --resolve-to IP list. The report prints reusable --fronting-target, --fronting-sni, --resolve-to, and --utls-profile values, and '--save' can merge those values into a YAML config file. Use '--config' to load default scan settings from YAML.",
+			Description: "Probe https://gstatic.com/generate_204 in selectable phases. 'full' runs IP discovery first and then fronting-domain/SNI probing, 'only-ip' scans accessible IPs, and 'only-domains' validates fronting targets and SNIs against explicit --resolve-to IPs plus any system-DNS IPs resolved from the provided --fronting-target values. The report prints reusable --fronting-target, --fronting-sni, --resolve-to, and --utls-profile values, and '--save' can merge those values into a YAML config file. Use '--config' to load default scan settings from YAML.",
 			Action:      handleScanCommand,
 			Flags:       scanCommandCLIFlags(),
 		},

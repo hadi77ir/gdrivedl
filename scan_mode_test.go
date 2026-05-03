@@ -7,7 +7,9 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestReadHostnames(t *testing.T) {
@@ -27,6 +29,30 @@ func TestReadIPSpecs(t *testing.T) {
 	}
 	if got, want := strings.Join(specs, ","), "203.0.113.10,203.0.113.0/30"; got != want {
 		t.Fatalf("specs = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultScanLoadersUseEmbeddedKnownLists(t *testing.T) {
+	hosts, err := defaultScanDomainLoader()
+	if err != nil {
+		t.Fatalf("defaultScanDomainLoader() error = %v", err)
+	}
+	if !containsString(hosts, "google.com") {
+		t.Fatalf("defaultScanDomainLoader() should include google.com")
+	}
+	if !containsString(hosts, "gstatic.com") {
+		t.Fatalf("defaultScanDomainLoader() should include gstatic.com")
+	}
+
+	specs, err := defaultScanIPSpecLoader()
+	if err != nil {
+		t.Fatalf("defaultScanIPSpecLoader() error = %v", err)
+	}
+	if !containsString(specs, "8.8.8.0/24") {
+		t.Fatalf("defaultScanIPSpecLoader() should include 8.8.8.0/24")
+	}
+	if !containsString(specs, "34.64.0.0/10") {
+		t.Fatalf("defaultScanIPSpecLoader() should include 34.64.0.0/10")
 	}
 }
 
@@ -257,20 +283,20 @@ func TestRunConnectivityScanOnlyDomainsIncludesFrontingSNI(t *testing.T) {
 		loadDefaultIPSpecs: func() ([]string, error) { return nil, nil },
 		resolveLocal: func(context.Context, string, *downloadRuntime) ([]string, error) {
 			localResolveCalls++
-			return nil, nil
+			return []string{"203.0.113.43"}, nil
 		},
 		resolveRemote: func(context.Context, string, *downloadRuntime) ([]string, error) {
 			remoteResolveCalls++
 			return nil, nil
 		},
 		dial: func(_ context.Context, _ transportConfig, ip string) error {
-			if ip == "203.0.113.42" {
+			if ip == "203.0.113.42" || ip == "203.0.113.43" {
 				return nil
 			}
 			return errors.New("dial fail")
 		},
 		probe: func(_ context.Context, cfg transportConfig, _ *downloadRuntime) error {
-			if cfg.Fronting.Target == "target.example.com" && cfg.Fronting.SNI == "sni.example.com" && cfg.ResolveTo == "203.0.113.42" {
+			if cfg.Fronting.Target == "target.example.com" && cfg.Fronting.SNI == "sni.example.com" && (cfg.ResolveTo == "203.0.113.42" || cfg.ResolveTo == "203.0.113.43") {
 				return nil
 			}
 			return errors.New("fronting fail")
@@ -285,8 +311,8 @@ func TestRunConnectivityScanOnlyDomainsIncludesFrontingSNI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runConnectivityScan() error = %v", err)
 	}
-	if localResolveCalls != 0 || remoteResolveCalls != 0 {
-		t.Fatalf("DNS resolvers should not be used in only-domains mode: local=%d remote=%d", localResolveCalls, remoteResolveCalls)
+	if localResolveCalls != 1 || remoteResolveCalls != 0 {
+		t.Fatalf("only-domains should resolve explicit fronting targets locally only: local=%d remote=%d", localResolveCalls, remoteResolveCalls)
 	}
 	if got := strings.Join(report.FrontingTargets, ","); got != "target.example.com" {
 		t.Fatalf("FrontingTargets = %q", got)
@@ -300,8 +326,85 @@ func TestRunConnectivityScanOnlyDomainsIncludesFrontingSNI(t *testing.T) {
 	if !reflect.DeepEqual(report.Targets[0].SNIs, []string{"sni.example.com"}) {
 		t.Fatalf("SNIs = %#v", report.Targets[0].SNIs)
 	}
-	if !reflect.DeepEqual(report.Targets[0].ResolveToIPs, []string{"203.0.113.42"}) {
+	if !reflect.DeepEqual(report.Targets[0].ResolveToIPs, []string{"203.0.113.42", "203.0.113.43"}) {
 		t.Fatalf("ResolveToIPs = %#v", report.Targets[0].ResolveToIPs)
+	}
+}
+
+func TestRunConnectivityScanOnlyDomainsAllowsFrontingTargetDNSWithoutResolveTo(t *testing.T) {
+	base := transportConfig{UTLSProfiles: []utlsProfileOption{{name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]}}}
+	deps := scanDependencies{
+		loadDefaultDomains: func() ([]string, error) { return nil, nil },
+		loadDefaultIPSpecs: func() ([]string, error) { return nil, nil },
+		resolveLocal: func(_ context.Context, host string, _ *downloadRuntime) ([]string, error) {
+			if host == "target.example.com" {
+				return []string{"203.0.113.44"}, nil
+			}
+			return nil, nil
+		},
+		resolveRemote: func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		dial: func(_ context.Context, _ transportConfig, ip string) error {
+			if ip == "203.0.113.44" {
+				return nil
+			}
+			return errors.New("dial fail")
+		},
+		probe: func(_ context.Context, cfg transportConfig, _ *downloadRuntime) error {
+			if cfg.Fronting.Target == "target.example.com" && cfg.ResolveTo == "203.0.113.44" {
+				return nil
+			}
+			return errors.New("fronting fail")
+		},
+	}
+	report, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{
+		Mode:            scanModeOnlyDomains,
+		FrontingTargets: []string{"target.example.com"},
+	}, nil, deps)
+	if err != nil {
+		t.Fatalf("runConnectivityScan() error = %v", err)
+	}
+	if got := strings.Join(report.DialAccessibleIPs, ","); got != "203.0.113.44" {
+		t.Fatalf("DialAccessibleIPs = %q", got)
+	}
+	if len(report.Targets) != 1 || !reflect.DeepEqual(report.Targets[0].ResolveToIPs, []string{"203.0.113.44"}) {
+		t.Fatalf("Targets = %#v", report.Targets)
+	}
+}
+
+func TestRunConnectivityScanUsesConfiguredConcurrency(t *testing.T) {
+	base := transportConfig{UTLSProfiles: []utlsProfileOption{
+		{name: "chrome_auto", id: supportedUTLSProfiles["chrome_auto"]},
+		{name: "firefox_auto", id: supportedUTLSProfiles["firefox_auto"]},
+	}}
+	var active int32
+	var maxActive int32
+	deps := scanDependencies{
+		loadDefaultDomains: func() ([]string, error) { return nil, nil },
+		loadDefaultIPSpecs: func() ([]string, error) { return nil, nil },
+		resolveLocal:       func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		resolveRemote:      func(context.Context, string, *downloadRuntime) ([]string, error) { return nil, nil },
+		dial:               func(context.Context, transportConfig, string) error { return nil },
+		probe: func(_ context.Context, cfg transportConfig, _ *downloadRuntime) error {
+			if !cfg.Fronting.Enable {
+				current := atomic.AddInt32(&active, 1)
+				for {
+					previous := atomic.LoadInt32(&maxActive)
+					if current <= previous || atomic.CompareAndSwapInt32(&maxActive, previous, current) {
+						break
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+				atomic.AddInt32(&active, -1)
+			}
+			return nil
+		},
+	}
+	_, err := runConnectivityScan(context.Background(), base, connectivityScanOptions{Mode: scanModeOnlyIP, Concurrency: 2}, nil, deps)
+	if err != nil {
+		t.Fatalf("runConnectivityScan() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&maxActive); got < 2 {
+		t.Fatalf("max concurrent probes = %d, want at least 2", got)
 	}
 }
 

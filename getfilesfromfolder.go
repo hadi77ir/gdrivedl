@@ -109,6 +109,10 @@ func (p *para) shouldUseFolderResumeFlow() bool {
 	return p != nil && p.APIKey != "" && p.Resumabledownload != ""
 }
 
+func (p *para) shouldRedownloadCompletedFolderFile() bool {
+	return p != nil && (p.EnableRedownload || p.OverWrite)
+}
+
 func (p *para) folderFileDownloadURL(file *drive.File) (string, error) {
 	u, err := url.Parse(driveAPI)
 	if err != nil {
@@ -219,6 +223,15 @@ func (p *para) markFolderFileAlreadyComplete(state folderLocalFileState) {
 	p.Task.MarkCompleted()
 }
 
+func (p *para) markFolderFileSkippedExisting(filename string) {
+	if !p.Disp {
+		p.printf("Downloading '%s' was skipped because of existing.\n", filename)
+	}
+	if p.Task != nil {
+		p.Task.MarkSkipped("existing file")
+	}
+}
+
 // downloadFileByAPIKey : Download file using API key.
 func (p *para) downloadFileByAPIKey(file *drive.File) error {
 	u, err := p.folderFileDownloadURL(file)
@@ -281,7 +294,7 @@ func (p *para) downloadFolderFile(file *drive.File) error {
 	if p.shouldUseFolderResumeFlow() {
 		return p.downloadFolderFileWithResume(file)
 	}
-	return p.downloadFolderFileDirect(file)
+	return p.downloadFolderFileWithResumeStrategy(file, (*para).restartFolderFileDownload, (*para).downloadFolderFileDirect)
 }
 
 func (p *para) downloadFolderFileDirect(file *drive.File) error {
@@ -315,9 +328,22 @@ func (p *para) resumeFolderFileChunk(file *drive.File) error {
 	return v.para.saveFile(res)
 }
 
+func (p *para) restartFolderFileDownload(file *drive.File) error {
+	return fmt.Errorf("%w: folder resumable download is disabled", errResumableFullRedownloadRequired)
+}
+
 func (p *para) downloadFolderFileWithResumeStrategy(file *drive.File, resume func(*para, *drive.File) error, direct func(*para, *drive.File) error) error {
 	state := p.inspectFolderLocalFile(file)
+	filename := firstNonEmpty(p.Filename, file.Name, filepath.Base(state.Path))
+	if state.Exists && p.Skip {
+		p.markFolderFileSkippedExisting(filename)
+		return nil
+	}
 	if state.Complete {
+		if p.shouldRedownloadCompletedFolderFile() {
+			p.statusf("Redownloading existing completed file: %s", state.Path)
+			return direct(p, file)
+		}
 		p.statusf("Keeping existing completed file: %s", state.Path)
 		p.markFolderFileAlreadyComplete(state)
 		return nil
@@ -354,27 +380,7 @@ func (p *para) downloadFolderFileWithResume(file *drive.File) error {
 
 // makeFileByCondition : Make file by condition.
 func (p *para) makeFileByCondition(file *drive.File) error {
-	if p.DryRun || p.shouldUseFolderResumeFlow() {
-		return p.downloadFolderFile(file)
-	}
-	filename := firstNonEmpty(p.Filename, file.Name)
-	if er := chkFile(filepath.Join(p.WorkDir, filename)); er {
-		if !p.OverWrite && !p.Skip {
-			return fmt.Errorf("'%s' is existing. If you want to overwrite, please use an option '--overwrite'", filepath.Join(p.WorkDir, filename))
-		}
-		if p.OverWrite && !p.Skip {
-			return p.downloadFolderFile(file)
-		}
-		if !p.Disp && p.Skip {
-			p.printf("Downloading '%s' was skipped because of existing.\n", filename)
-			if p.Task != nil {
-				p.Task.MarkSkipped("existing file")
-			}
-		}
-	} else {
-		return p.downloadFolderFile(file)
-	}
-	return nil
+	return p.downloadFolderFile(file)
 }
 
 // makeDir : Make a directory by checking duplication.
@@ -402,24 +408,19 @@ func (p *para) makeDirByCondition(dir string) error {
 	if p.DryRun {
 		return nil
 	}
-	var err error
-	if er := chkFile(dir); er {
-		if !p.OverWrite && !p.Skip {
-			return fmt.Errorf("'%s' is existing. If you want to overwrite, please use option '--overwrite' or '--skip'", dir)
+	info, err := os.Stat(dir)
+	if err == nil {
+		if info.IsDir() {
+			return nil
 		}
-		if p.OverWrite && !p.Skip {
-			if err = p.makeDir(dir); err != nil {
-				return err
-			}
-		}
-		if !p.Disp && p.Skip {
-			p.printf("Creating '%s' was skipped because of existing.\n", dir)
-		}
-	} else {
-		p.statusf("Creating directory path: %s", dir)
-		if err = p.makeDir(dir); err != nil {
-			return err
-		}
+		return fmt.Errorf("'%s' exists and is not a directory", dir)
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	p.statusf("Creating directory path: %s", dir)
+	if err = p.makeDir(dir); err != nil {
+		return err
 	}
 	return nil
 }

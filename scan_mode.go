@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -21,25 +22,9 @@ import (
 const (
 	scanProbeURL          = "https://gstatic.com/generate_204"
 	scanRemoteDNSURL      = "https://dns.google/resolve"
-	scanDomainAssetPath   = "assets/google-subdomains.txt"
-	scanIPAssetPath       = "assets/google-ips.txt"
 	scanMaxCIDRHostCount  = 65536
 	scanRemoteDNSFronting = "google.com"
 )
-
-var embeddedScanDomains = []string{
-	"gstatic.com",
-	"www.gstatic.com",
-	"google.com",
-	"www.google.com",
-	"ssl.gstatic.com",
-	"fonts.gstatic.com",
-	"accounts.google.com",
-	"clients6.google.com",
-	"ogs.google.com",
-	"play.google.com",
-	"support.google.com",
-}
 
 type scanMode string
 
@@ -51,6 +36,7 @@ const (
 
 type connectivityScanOptions struct {
 	Mode            scanMode
+	Concurrency     int
 	ExtraDomains    []string
 	ExtraIPSpecs    []string
 	FrontingSNIs    []string
@@ -229,45 +215,6 @@ func dedupeStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
-}
-
-func readOptionalHostnameAsset(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer file.Close()
-	return readHostnames(file)
-}
-
-func readOptionalIPAsset(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer file.Close()
-	return readIPSpecs(file)
-}
-
-func defaultScanDomainLoader() ([]string, error) {
-	hosts, err := readOptionalHostnameAsset(scanDomainAssetPath)
-	if err != nil {
-		return nil, err
-	}
-	if len(hosts) > 0 {
-		return hosts, nil
-	}
-	return append([]string(nil), embeddedScanDomains...), nil
-}
-
-func defaultScanIPSpecLoader() ([]string, error) {
-	return readOptionalIPAsset(scanIPAssetPath)
 }
 
 func defaultScanResolver(ctx context.Context, host string, _ *downloadRuntime) ([]string, error) {
@@ -556,6 +503,10 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 		ctx = context.Background()
 	}
 	deps = deps.withDefaults(base)
+	concurrency := options.Concurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
 	mode := options.Mode
 	if mode == "" {
 		mode = scanModeFull
@@ -583,10 +534,12 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 	snis := scanCandidateSNIs(domains, options.FrontingSNIs)
 	observer.addTotal(int64(len(profiles)))
 	observer.beginPhase("direct_probe")
-	for _, profile := range profiles {
+	directWorked := make([]bool, len(profiles))
+	if err := runScanParallel(ctx, concurrency, len(profiles), func(index int) error {
 		if err := checkScanContext(ctx); err != nil {
-			return report, err
+			return err
 		}
+		profile := profiles[index]
 		cfg := base
 		cfg.Scan = false
 		cfg.disableUTLSFallback = true
@@ -597,13 +550,24 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 		cfg.UTLSProfile = profile.id
 		cfg.UTLSProfiles = []utlsProfileOption{profile}
 		observer.update("probing", fmt.Sprintf("direct profile=%s", profile.name))
-		if err := deps.probe(ctx, cfg, runtime); err == nil {
-			report.DirectProfiles = append(report.DirectProfiles, profile.name)
-			report.UTLSProfiles = append(report.UTLSProfiles, profile.name)
-		} else if isCancellationError(err) {
-			return report, err
+		probeErr := deps.probe(ctx, cfg, runtime)
+		if probeErr == nil {
+			directWorked[index] = true
+		} else if isCancellationError(probeErr) {
+			return probeErr
 		}
 		observer.complete()
+		return nil
+	}); err != nil {
+		return report, err
+	}
+	for index, worked := range directWorked {
+		if !worked {
+			continue
+		}
+		profile := profiles[index]
+		report.DirectProfiles = append(report.DirectProfiles, profile.name)
+		report.UTLSProfiles = append(report.UTLSProfiles, profile.name)
 	}
 	targetResults := map[string]*scanTargetResult{}
 	getTarget := func(domain string) *scanTargetResult {
@@ -619,38 +583,54 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 	case scanModeFull, scanModeOnlyIP:
 		observer.addTotal(int64(len(domains) * 2))
 		observer.beginPhase("local_dns")
-		for _, domain := range domains {
+		localDNSResults := make([][]string, len(domains))
+		if err := runScanParallel(ctx, concurrency, len(domains), func(index int) error {
 			if err := checkScanContext(ctx); err != nil {
-				return report, err
+				return err
 			}
-			result := getTarget(domain)
+			domain := domains[index]
 			observer.update("resolving", fmt.Sprintf("local dns host=%s", domain))
-			ips, err := deps.resolveLocal(ctx, domain, runtime)
-			if isCancellationError(err) {
-				return report, err
+			ips, resolveErr := deps.resolveLocal(ctx, domain, runtime)
+			if isCancellationError(resolveErr) {
+				return resolveErr
 			}
-			if err == nil {
-				result.LocalDNSIPs = dedupeStrings(ips)
+			if resolveErr == nil {
+				localDNSResults[index] = dedupeStrings(ips)
 			}
-			dialSources = append(dialSources, scanIPSourceResult{Source: "local_dns", Target: domain, CandidateIPs: result.LocalDNSIPs})
 			observer.complete()
+			return nil
+		}); err != nil {
+			return report, err
+		}
+		for index, domain := range domains {
+			result := getTarget(domain)
+			result.LocalDNSIPs = localDNSResults[index]
+			dialSources = append(dialSources, scanIPSourceResult{Source: "local_dns", Target: domain, CandidateIPs: result.LocalDNSIPs})
 		}
 		observer.beginPhase("remote_dns")
-		for _, domain := range domains {
+		remoteDNSResults := make([][]string, len(domains))
+		if err := runScanParallel(ctx, concurrency, len(domains), func(index int) error {
 			if err := checkScanContext(ctx); err != nil {
-				return report, err
+				return err
 			}
-			result := getTarget(domain)
+			domain := domains[index]
 			observer.update("resolving", fmt.Sprintf("remote dns host=%s", domain))
-			ips, err := deps.resolveRemote(ctx, domain, runtime)
-			if isCancellationError(err) {
-				return report, err
+			ips, resolveErr := deps.resolveRemote(ctx, domain, runtime)
+			if isCancellationError(resolveErr) {
+				return resolveErr
 			}
-			if err == nil {
-				result.RemoteDNSIPs = dedupeStrings(ips)
+			if resolveErr == nil {
+				remoteDNSResults[index] = dedupeStrings(ips)
 			}
-			dialSources = append(dialSources, scanIPSourceResult{Source: "remote_dns", Target: domain, CandidateIPs: result.RemoteDNSIPs})
 			observer.complete()
+			return nil
+		}); err != nil {
+			return report, err
+		}
+		for index, domain := range domains {
+			result := getTarget(domain)
+			result.RemoteDNSIPs = remoteDNSResults[index]
+			dialSources = append(dialSources, scanIPSourceResult{Source: "remote_dns", Target: domain, CandidateIPs: result.RemoteDNSIPs})
 		}
 		if len(options.ResolveToAddrs) > 0 {
 			dialSources = append(dialSources, scanIPSourceResult{Source: "resolve_to", CandidateIPs: dedupeStrings(options.ResolveToAddrs)})
@@ -670,53 +650,82 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 			dialSources = append(dialSources, scanIPSourceResult{Source: "ip_ranges", CandidateIPs: rangeIPs})
 		}
 	case scanModeOnlyDomains:
-		if len(options.ResolveToAddrs) == 0 {
-			err := fmt.Errorf("--resolve-to is required when --scan-mode only-domains is used")
+		explicitFrontingTargets := dedupeStrings(options.FrontingTargets)
+		if len(options.ResolveToAddrs) == 0 && len(explicitFrontingTargets) == 0 {
+			err := fmt.Errorf("--resolve-to or --fronting-target is required when --scan-mode only-domains is used")
 			return report, err
 		}
 		dialSources = append(dialSources, scanIPSourceResult{Source: "resolve_to", CandidateIPs: dedupeStrings(options.ResolveToAddrs)})
+		if len(explicitFrontingTargets) > 0 {
+			observer.addTotal(int64(len(explicitFrontingTargets)))
+			observer.beginPhase("fronting_target_dns")
+			frontingDNSResults := make([][]string, len(explicitFrontingTargets))
+			if err := runScanParallel(ctx, concurrency, len(explicitFrontingTargets), func(index int) error {
+				if err := checkScanContext(ctx); err != nil {
+					return err
+				}
+				target := explicitFrontingTargets[index]
+				observer.update("resolving", fmt.Sprintf("fronting target dns host=%s", target))
+				ips, resolveErr := deps.resolveLocal(ctx, target, runtime)
+				if isCancellationError(resolveErr) {
+					return resolveErr
+				}
+				if resolveErr == nil {
+					frontingDNSResults[index] = dedupeStrings(ips)
+				}
+				observer.complete()
+				return nil
+			}); err != nil {
+				return report, err
+			}
+			for index, target := range explicitFrontingTargets {
+				result := getTarget(target)
+				result.LocalDNSIPs = dedupeStrings(append(result.LocalDNSIPs, frontingDNSResults[index]...))
+				dialSources = append(dialSources, scanIPSourceResult{Source: "fronting_target_dns", Target: target, CandidateIPs: frontingDNSResults[index]})
+			}
+		}
 	default:
 		err := fmt.Errorf("unsupported scan mode %q", mode)
 		return report, err
 	}
 	dialResults := make([]scanIPSourceResult, 0, len(dialSources))
-	dialCache := map[string]bool{}
 	var dialAccessible []string
-	var totalDialCandidates int64
-	for _, source := range dialSources {
-		totalDialCandidates += int64(len(dedupeStrings(source.CandidateIPs)))
-	}
-	observer.addTotal(totalDialCandidates)
-	observer.beginPhase("dial")
-	for _, source := range dialSources {
-		if err := checkScanContext(ctx); err != nil {
-			return report, err
+	uniqueDialIPs := make([]string, 0)
+	uniqueDialIndex := map[string]int{}
+	for index := range dialSources {
+		dialSources[index].CandidateIPs = dedupeStrings(dialSources[index].CandidateIPs)
+		for _, ip := range dialSources[index].CandidateIPs {
+			if _, exists := uniqueDialIndex[ip]; exists {
+				continue
+			}
+			uniqueDialIndex[ip] = len(uniqueDialIPs)
+			uniqueDialIPs = append(uniqueDialIPs, ip)
 		}
-		source.CandidateIPs = dedupeStrings(source.CandidateIPs)
+	}
+	observer.addTotal(int64(len(uniqueDialIPs)))
+	observer.beginPhase("dial")
+	dialWorked := make([]bool, len(uniqueDialIPs))
+	if err := runScanParallel(ctx, concurrency, len(uniqueDialIPs), func(index int) error {
+		if err := checkScanContext(ctx); err != nil {
+			return err
+		}
+		ip := uniqueDialIPs[index]
+		observer.update("dialing", fmt.Sprintf("ip=%s", ip))
+		dialWorked[index] = deps.dial(ctx, base, ip) == nil
+		observer.complete()
+		return nil
+	}); err != nil {
+		return report, err
+	}
+	for _, source := range dialSources {
 		if len(source.CandidateIPs) == 0 {
 			continue
 		}
 		for _, ip := range source.CandidateIPs {
-			if err := checkScanContext(ctx); err != nil {
-				return report, err
-			}
-			current := ip
-			if source.Target != "" {
-				current = fmt.Sprintf("source=%s target=%s ip=%s", source.Source, source.Target, ip)
-			} else {
-				current = fmt.Sprintf("source=%s ip=%s", source.Source, ip)
-			}
-			observer.update("dialing", current)
-			worked, seen := dialCache[ip]
-			if !seen {
-				worked = deps.dial(ctx, base, ip) == nil
-				dialCache[ip] = worked
-			}
-			if worked {
+			if dialWorked[uniqueDialIndex[ip]] {
 				source.AccessibleIPs = append(source.AccessibleIPs, ip)
 				dialAccessible = append(dialAccessible, ip)
 			}
-			observer.complete()
 		}
 		source.AccessibleIPs = dedupeStrings(source.AccessibleIPs)
 		dialResults = append(dialResults, source)
@@ -724,56 +733,87 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 	report.DialSources = dialResults
 	report.DialAccessibleIPs = dedupeStrings(dialAccessible)
 	if mode != scanModeOnlyIP {
-		observer.addTotal(int64(len(domains) * len(report.DialAccessibleIPs) * len(snis) * len(profiles)))
+		totalFrontingProbes := len(domains) * len(report.DialAccessibleIPs) * len(snis) * len(profiles)
+		observer.addTotal(int64(totalFrontingProbes))
 		observer.beginPhase("fronting_probe")
-		for _, domain := range domains {
+		type frontingSuccess struct {
+			domain      string
+			resolveToIP string
+			sni         string
+			profile     string
+		}
+		frontingSuccesses := make([]frontingSuccess, 0)
+		var frontingMu sync.Mutex
+		if err := runScanParallel(ctx, concurrency, totalFrontingProbes, func(index int) error {
 			if err := checkScanContext(ctx); err != nil {
-				return report, err
+				return err
 			}
+			profileCount := len(profiles)
+			sniCount := len(snis)
+			ipCount := len(report.DialAccessibleIPs)
+			domainIndex := index / (ipCount * sniCount * profileCount)
+			remaining := index % (ipCount * sniCount * profileCount)
+			ipIndex := remaining / (sniCount * profileCount)
+			remaining = remaining % (sniCount * profileCount)
+			sniIndex := remaining / profileCount
+			profileIndex := remaining % profileCount
+
+			domain := domains[domainIndex]
+			ip := report.DialAccessibleIPs[ipIndex]
+			sni := snis[sniIndex]
+			profile := profiles[profileIndex]
+
+			cfg := base
+			cfg.Scan = false
+			cfg.disableUTLSFallback = true
+			cfg.Fronting = frontingConfig{Enable: true, Target: domain, Targets: []string{domain}, SNI: sni, explicitSNI: true}
+			cfg.ResolveTo = ip
+			cfg.ResolveToAddrs = []string{ip}
+			cfg.UTLSProfileName = profile.name
+			cfg.UTLSProfile = profile.id
+			cfg.UTLSProfiles = []utlsProfileOption{profile}
+			observer.update("probing", fmt.Sprintf("target=%s sni=%s ip=%s profile=%s", domain, sni, ip, profile.name))
+			probeErr := deps.probe(ctx, cfg, runtime)
+			if probeErr != nil {
+				if isCancellationError(probeErr) {
+					return probeErr
+				}
+				observer.complete()
+				return nil
+			}
+			frontingMu.Lock()
+			frontingSuccesses = append(frontingSuccesses, frontingSuccess{domain: domain, resolveToIP: ip, sni: sni, profile: profile.name})
+			frontingMu.Unlock()
+			observer.complete()
+			return nil
+		}); err != nil {
+			return report, err
+		}
+		sort.Slice(frontingSuccesses, func(i, j int) bool {
+			left := frontingSuccesses[i]
+			right := frontingSuccesses[j]
+			if left.domain != right.domain {
+				return left.domain < right.domain
+			}
+			if left.resolveToIP != right.resolveToIP {
+				return left.resolveToIP < right.resolveToIP
+			}
+			if left.sni != right.sni {
+				return left.sni < right.sni
+			}
+			return left.profile < right.profile
+		})
+		for _, success := range frontingSuccesses {
+			result := getTarget(success.domain)
+			result.Profiles = append(result.Profiles, success.profile)
+			result.SNIs = append(result.SNIs, success.sni)
+			result.ResolveToIPs = append(result.ResolveToIPs, success.resolveToIP)
+			report.UTLSProfiles = append(report.UTLSProfiles, success.profile)
+			report.FrontingSNIs = append(report.FrontingSNIs, success.sni)
+			report.ResolveToAddrs = append(report.ResolveToAddrs, success.resolveToIP)
+		}
+		for _, domain := range domains {
 			result := getTarget(domain)
-			for _, ip := range report.DialAccessibleIPs {
-				if err := checkScanContext(ctx); err != nil {
-					return report, err
-				}
-				ipWorked := false
-				for _, sni := range snis {
-					if err := checkScanContext(ctx); err != nil {
-						return report, err
-					}
-					for _, profile := range profiles {
-						if err := checkScanContext(ctx); err != nil {
-							return report, err
-						}
-						cfg := base
-						cfg.Scan = false
-						cfg.disableUTLSFallback = true
-						cfg.Fronting = frontingConfig{Enable: true, Target: domain, Targets: []string{domain}, SNI: sni, explicitSNI: true}
-						cfg.ResolveTo = ip
-						cfg.ResolveToAddrs = []string{ip}
-						cfg.UTLSProfileName = profile.name
-						cfg.UTLSProfile = profile.id
-						cfg.UTLSProfiles = []utlsProfileOption{profile}
-						observer.update("probing", fmt.Sprintf("target=%s sni=%s ip=%s profile=%s", domain, sni, ip, profile.name))
-						if err := deps.probe(ctx, cfg, runtime); err != nil {
-							if isCancellationError(err) {
-								return report, err
-							}
-							observer.complete()
-							continue
-						}
-						result.Profiles = append(result.Profiles, profile.name)
-						result.SNIs = append(result.SNIs, sni)
-						report.UTLSProfiles = append(report.UTLSProfiles, profile.name)
-						report.FrontingSNIs = append(report.FrontingSNIs, sni)
-						ipWorked = true
-						observer.complete()
-					}
-				}
-				if ipWorked {
-					result.ResolveToIPs = append(result.ResolveToIPs, ip)
-					report.ResolveToAddrs = append(report.ResolveToAddrs, ip)
-				}
-			}
 			result.LocalDNSIPs = dedupeStrings(result.LocalDNSIPs)
 			result.RemoteDNSIPs = dedupeStrings(result.RemoteDNSIPs)
 			result.Profiles = dedupeStrings(result.Profiles)
@@ -795,6 +835,72 @@ func runConnectivityScan(ctx context.Context, base transportConfig, options conn
 		return report, err
 	}
 	return report, nil
+}
+
+func runScanParallel(ctx context.Context, concurrency, count int, fn func(int) error) error {
+	if count == 0 {
+		return checkScanContext(ctx)
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > count {
+		concurrency = count
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	recordErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+	worker := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case index, ok := <-jobs:
+				if !ok {
+					return
+				}
+				if err := fn(index); err != nil {
+					recordErr(err)
+					return
+				}
+			}
+		}
+	}
+	for workerIndex := 0; workerIndex < concurrency; workerIndex++ {
+		wg.Add(1)
+		go worker()
+	}
+loop:
+	for index := 0; index < count; index++ {
+		select {
+		case <-workerCtx.Done():
+			break loop
+		case jobs <- index:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	errMu.Lock()
+	defer errMu.Unlock()
+	if firstErr != nil {
+		return firstErr
+	}
+	return checkScanContext(ctx)
 }
 
 func checkScanContext(ctx context.Context) error {

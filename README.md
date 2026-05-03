@@ -125,9 +125,18 @@ Resume a folder download and keep already completed files:
 gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' --api-key "$GDRIVEDL_APIKEY" --resumable-download 100m
 ```
 
-- Completed files are kept and skipped.
+Force matching completed files inside a folder to be downloaded again:
+
+```bash
+gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' --enable-redownload
+```
+
+- Existing directories are reused automatically on later folder runs.
+- Completed files are kept and skipped by default when the local size matches the folder listing or resolved remote size.
+- Use `--enable-redownload` to download already completed matching files again.
 - Partial files are resumed when range downloads are supported.
 - If a file cannot be resumed, `gdrivedl` preserves the partial file temporarily and re-downloads that file from the beginning instead of failing the whole folder resume path.
+- If resumable folder mode is not enabled or not available, mismatched partial files are re-downloaded instead.
 - Pressing `Ctrl+C` cancels the current job through the shared context, keeps the closest safe partial state on disk, and lets you rerun later with `-r` to continue from the nearest possible point.
 
 Test a download request without writing any files:
@@ -189,6 +198,12 @@ gdrivedl scan \
   --fronting-sni www.google.com
 ```
 
+Run the scanner with parallel workers and a per-probe round-trip timeout:
+
+```bash
+gdrivedl scan --scan-concurrency 8 --roundtrip-timeout 8s
+```
+
 Add extra candidate domains from a file or from standard input:
 
 ```bash
@@ -223,11 +238,13 @@ The scanner probes `https://gstatic.com/generate_204` and reports reusable value
 
 Scanner runs are cancellable with `Ctrl+C`. `--verbosity 1` shows phase-level live logs, `--verbosity 2` adds step-level details, and `--json` emits structured timestamped `log` and `progress` events while the scan is running.
 
-`--scan-mode full` runs both phases sequentially. `--scan-mode only-ip` scans DNS results, configured `--resolve-to` values, and IP ranges. `--scan-mode only-domains` skips DNS/IP discovery and probes fronting targets plus any extra `--fronting-sni` hostnames against the supplied `--resolve-to` IP list.
+`--scan-mode full` runs both phases sequentially. `--scan-mode only-ip` scans DNS results, configured `--resolve-to` values, and IP ranges. `--scan-mode only-domains` accepts explicit `--resolve-to` IPs, and when `--fronting-target` is provided it also widens the scan with system-DNS IPs resolved from those fronting targets, even if `--resolve-to` is already set.
+
+`--scan-concurrency` controls how many scan workers run in parallel for direct probes, DNS resolution, dial checks, and fronting probes. `--roundtrip-timeout` limits each individual transport probe/request round trip without changing the higher-level HTTP client timeout.
 
 `--save` writes the scan results back into a YAML config file. It preserves unrelated sections such as `defaults`, `get`, and `merge`, while updating reusable `transport` and `scan` values such as `fronting-target`, `fronting-sni`, `resolve-to`, and `utls-profile`.
 
-It loads candidate subdomains from `assets/google-subdomains.txt` when present, falls back to the embedded list otherwise, and can extend the list with `--scan-domain-list`. It also loads Google IPs and CIDR ranges from `assets/google-ips.txt` and can extend those with `--scan-ip-list`.
+It uses embedded default scan sources generated from `assets/known-domains.txt` and `assets/known-ip-ranges.txt`, and you can extend them with `--scan-domain-list` and `--scan-ip-list`. By default, scan samples up to `16` IPs from each CIDR; set `--scan-ip-random-count 0` to expand ranges fully.
 
 ## Merge
 
@@ -261,10 +278,17 @@ Use the older streaming mode that writes directly to the final output and delete
 gdrivedl merge -o merged.bin --unsafe ./download-parts
 ```
 
+Preview the merge order without writing the output file:
+
+```bash
+gdrivedl merge -o merged.bin --dry-run ./download-parts
+```
+
 Notes:
 
 - `gdrivedl merge` uses safe mode by default: it writes to a temporary output first, renames it into place after success, and keeps source chunks unless `--delete-chunks` is set.
 - `gdrivedl merge --unsafe` restores the old direct-write behavior and deletes chunks while merging, but cancellation is not supported in that mode.
+- `gdrivedl merge --dry-run` prints the chunk paths in the same alphanumeric ascending order that the real merge will use, and does not create the output file or delete any inputs.
 
 ## YAML Config
 
@@ -283,6 +307,7 @@ defaults:
 transport:
   proxy: http://127.0.0.1:2089
   timeout: 45s
+  roundtrip-timeout: 10s
   retry-count: 2
   verbosity: 1
 
@@ -291,12 +316,14 @@ get:
   concurrency: 4
   directory: /tmp/downloads
   api-key: your-api-key
+  enable-redownload: false
   fronting-enable: true
   fronting-target: google.com
   utls-profile: firefox_auto,chrome_auto
 
 scan:
   scan-mode: full
+  scan-concurrency: 8
   fronting-enable: true
   fronting-target: google.com
   scan-ip-random-count: 16
@@ -304,6 +331,7 @@ scan:
 merge:
   progress: true
   delete-chunks: false
+  dry-run: false
 ```
 
 Config files intentionally do not accept one-shot CLI inputs such as `url`, `url-list`, `help`, `version`, or merge input arguments.

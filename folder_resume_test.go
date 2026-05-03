@@ -54,6 +54,68 @@ func TestDownloadFolderFileWithResumeStrategySkipsCompletedFile(t *testing.T) {
 	}
 }
 
+func TestDownloadFolderFileWithResumeStrategyRedownloadsCompletedFileWhenEnabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alpha.bin")
+	if err := os.WriteFile(path, []byte("hello"), 0o666); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	p := &para{WorkDir: dir, EnableRedownload: true, Disp: true}
+	file := &drive.File{Id: "file-id", Name: "alpha.bin", Size: 5}
+	resumeCalled := false
+	directCalled := false
+
+	err := p.downloadFolderFileWithResumeStrategy(file,
+		func(*para, *drive.File) error {
+			resumeCalled = true
+			return nil
+		},
+		func(p *para, file *drive.File) error {
+			directCalled = true
+			return os.WriteFile(filepath.Join(p.WorkDir, file.Name), []byte("world"), 0o666)
+		},
+	)
+	if err != nil {
+		t.Fatalf("downloadFolderFileWithResumeStrategy() error = %v", err)
+	}
+	if resumeCalled {
+		t.Fatal("resume downloader should not be called for completed file redownload")
+	}
+	if !directCalled {
+		t.Fatal("direct downloader was not called")
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(content) != "world" {
+		t.Fatalf("final content = %q, want world", string(content))
+	}
+}
+
+func TestMakeFileByConditionSkipsCompletedFolderFileWithoutResumeMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alpha.bin")
+	if err := os.WriteFile(path, []byte("hello"), 0o666); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	runtime := newDownloadRuntime(false, false)
+	task := runtime.newTask("alpha.bin", "file-id")
+	p := &para{WorkDir: dir, Task: task}
+	file := &drive.File{Id: "file-id", Name: "alpha.bin", Size: 5}
+
+	if err := p.makeFileByCondition(file); err != nil {
+		t.Fatalf("makeFileByCondition() error = %v", err)
+	}
+	snapshot := task.snapshot()
+	if snapshot.Status != taskCompleted {
+		t.Fatalf("task status = %q, want %q", snapshot.Status, taskCompleted)
+	}
+	if snapshot.Detail != "already complete" {
+		t.Fatalf("task detail = %q, want already complete", snapshot.Detail)
+	}
+}
+
 func TestDownloadFolderFileWithResumeStrategyPreservesPartialBeforeFallback(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "alpha.bin")

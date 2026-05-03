@@ -6,6 +6,8 @@
 bin/
 out/
 
+assets/sources/
+
 ##########
 # Golang #
 ##########

@@ -150,7 +150,7 @@ func formatDefaultsYAMLSection(values yamlDefaultsFileConfig) []string {
 }
 
 func formatTransportYAMLSection(name string, values yamlTransportFileConfig) []string {
-	lines := make([]string, 0, 16)
+	lines := make([]string, 0, 20)
 	appendBoolYAMLLine(&lines, "dump-request", values.DumpRequest)
 	appendBoolYAMLLine(&lines, "dump-response", values.DumpResponse)
 	appendBoolYAMLLine(&lines, "fronting-enable", values.FrontingEnable)
@@ -159,6 +159,7 @@ func formatTransportYAMLSection(name string, values yamlTransportFileConfig) []s
 	appendBoolYAMLLine(&lines, "force-http1", values.ForceHTTP1)
 	appendBoolYAMLLine(&lines, "prefer-http2", values.PreferHTTP2)
 	appendStringYAMLLine(&lines, "proxy", values.Proxy)
+	appendStringYAMLLine(&lines, "roundtrip-timeout", values.RoundTripTimeout)
 	appendStringYAMLLine(&lines, "request-delay", values.RequestDelay)
 	appendStringYAMLLine(&lines, "resolve-to", values.ResolveTo)
 	appendIntYAMLLine(&lines, "retry-count", values.RetryCount)
@@ -196,9 +197,10 @@ func formatGetYAMLSection(values yamlGetFileConfig) []string {
 }
 
 func formatScanYAMLSection(values yamlScanFileConfig) []string {
-	lines := make([]string, 0, 20)
+	lines := make([]string, 0, 22)
 	lines = append(lines, formatTransportYAMLSectionLines(values.yamlTransportFileConfig)...)
 	appendBoolYAMLLine(&lines, "json", values.JSONOutput)
+	appendIntYAMLLine(&lines, "scan-concurrency", values.ScanConcurrency)
 	appendStringYAMLLine(&lines, "scan-mode", values.ScanMode)
 	return wrapYAMLSection("scan", lines)
 }
@@ -224,7 +226,7 @@ func formatMergeYAMLSection(values yamlMergeFileConfig) []string {
 }
 
 func formatTransportYAMLSectionLines(values yamlTransportFileConfig) []string {
-	lines := make([]string, 0, 16)
+	lines := make([]string, 0, 20)
 	appendBoolYAMLLine(&lines, "dump-request", values.DumpRequest)
 	appendBoolYAMLLine(&lines, "dump-response", values.DumpResponse)
 	appendBoolYAMLLine(&lines, "fronting-enable", values.FrontingEnable)
@@ -233,6 +235,7 @@ func formatTransportYAMLSectionLines(values yamlTransportFileConfig) []string {
 	appendBoolYAMLLine(&lines, "force-http1", values.ForceHTTP1)
 	appendBoolYAMLLine(&lines, "prefer-http2", values.PreferHTTP2)
 	appendStringYAMLLine(&lines, "proxy", values.Proxy)
+	appendStringYAMLLine(&lines, "roundtrip-timeout", values.RoundTripTimeout)
 	appendStringYAMLLine(&lines, "request-delay", values.RequestDelay)
 	appendStringYAMLLine(&lines, "resolve-to", values.ResolveTo)
 	appendIntYAMLLine(&lines, "retry-count", values.RetryCount)

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTransportTraceHelpers(t *testing.T) {
@@ -55,6 +57,31 @@ func TestTransportConfigNewHTTPClientTimeout(t *testing.T) {
 	}
 	if client.Timeout != 12 {
 		t.Fatalf("client timeout = %v, want 12ns", client.Timeout)
+	}
+}
+
+func TestTransportRoundTripTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := (transportConfig{RoundTripTimeout: 50 * time.Millisecond}).newHTTPClient(nil)
+	if err != nil {
+		t.Fatalf("newHTTPClient() error = %v", err)
+	}
+
+	startedAt := time.Now()
+	_, err = client.Get(server.URL)
+	if err == nil {
+		t.Fatal("expected round-trip timeout error")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 180*time.Millisecond {
+		t.Fatalf("round-trip timeout elapsed = %v, want faster failure", elapsed)
 	}
 }
 

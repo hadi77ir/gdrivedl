@@ -24,6 +24,7 @@ func TestParseGetCommandConfigTransportOptions(t *testing.T) {
 		"--exit-report",
 		"--concurrency", "3",
 		"--timeout", "45s",
+		"--roundtrip-timeout", "12s",
 		"--request-delay", "1500ms",
 		"--retry-count", "4",
 		"--verbosity", "2",
@@ -68,6 +69,9 @@ func TestParseGetCommandConfigTransportOptions(t *testing.T) {
 	}
 	if cfg.Transport.Timeout.Seconds() != 45 {
 		t.Fatalf("timeout = %v, want 45s", cfg.Transport.Timeout)
+	}
+	if cfg.Transport.RoundTripTimeout != 12*time.Second {
+		t.Fatalf("roundtrip timeout = %v, want 12s", cfg.Transport.RoundTripTimeout)
 	}
 	if cfg.Transport.RequestDelay != 1500*time.Millisecond {
 		t.Fatalf("request delay = %v, want 1500ms", cfg.Transport.RequestDelay)
@@ -136,11 +140,13 @@ func TestParseScanCommandOptions(t *testing.T) {
 	ctx := newTestCommandContext(t, "scan", []string{
 		"--json",
 		"--scan-mode", "only-domains",
+		"--scan-concurrency", "5",
 		"--save", "scan-results.yml",
 		"--scan-domain-list", "domains.txt",
 		"--scan-ip-list", "ips.txt",
 		"--scan-ip-random-count", "7",
 		"--timeout", "45s",
+		"--roundtrip-timeout", "6s",
 		"--request-delay", "1500ms",
 		"--retry-count", "4",
 		"--verbosity", "2",
@@ -168,6 +174,9 @@ func TestParseScanCommandOptions(t *testing.T) {
 	if options.ScanMode != scanModeOnlyDomains {
 		t.Fatalf("scan-mode = %q, want %q", options.ScanMode, scanModeOnlyDomains)
 	}
+	if options.ScanConcurrency != 5 {
+		t.Fatalf("scan-concurrency = %d, want 5", options.ScanConcurrency)
+	}
 	if options.SavePath != "scan-results.yml" {
 		t.Fatalf("save = %q, want scan-results.yml", options.SavePath)
 	}
@@ -186,6 +195,9 @@ func TestParseScanCommandOptions(t *testing.T) {
 	}
 	if transport.Timeout.Seconds() != 45 {
 		t.Fatalf("timeout = %v, want 45s", transport.Timeout)
+	}
+	if transport.RoundTripTimeout != 6*time.Second {
+		t.Fatalf("roundtrip timeout = %v, want 6s", transport.RoundTripTimeout)
 	}
 	if transport.RequestDelay != 1500*time.Millisecond {
 		t.Fatalf("request delay = %v, want 1500ms", transport.RequestDelay)
@@ -275,6 +287,7 @@ func TestParseGetCommandConfigValidation(t *testing.T) {
 		{args: []string{"--concurrency", "0"}, wantErr: "--concurrency must be greater than 0"},
 		{args: []string{"--verbosity", "-1"}, wantErr: "--verbosity must be greater than or equal to 0"},
 		{args: []string{"--timeout", "abcx"}, wantErr: "--timeout must be a valid duration"},
+		{args: []string{"--roundtrip-timeout", "abcx"}, wantErr: "--roundtrip-timeout must be a valid duration"},
 		{args: []string{"--request-delay", "abcx"}, wantErr: "--request-delay must be a valid duration"},
 		{args: []string{"--prefer-http2", "--force-http1"}, wantErr: "--prefer-http2 cannot be used with --force-http1"},
 		{args: []string{"--share-http2-connection", "--force-http1"}, wantErr: "--share-http2-connection cannot be used with --force-http1"},
@@ -303,6 +316,7 @@ func TestParseScanCommandValidation(t *testing.T) {
 		wantErr string
 	}{
 		{args: []string{"--scan-ip-random-count", "-1"}, wantErr: "--scan-ip-random-count must be greater than or equal to 0"},
+		{args: []string{"--scan-concurrency", "-1"}, wantErr: "--scan-concurrency must be greater than or equal to 0"},
 		{args: []string{"--scan-mode", "invalid"}, wantErr: "unsupported --scan-mode"},
 	}
 	for _, tt := range tests {
@@ -436,6 +450,7 @@ func TestParseGetCommandConfigFromYAMLFile(t *testing.T) {
 		"  concurrency: 4",
 		"  directory: /tmp/from-config",
 		"  api-key: config-key",
+		"  enable-redownload: true",
 		"  mime-type: image/png,application/pdf",
 		"  fronting-enable: true",
 		"  fronting-target: front-a.example.com,front-b.example.com",
@@ -470,6 +485,9 @@ func TestParseGetCommandConfigFromYAMLFile(t *testing.T) {
 	}
 	if cfg.APIKey != "config-key" {
 		t.Fatalf("api-key = %q, want config-key", cfg.APIKey)
+	}
+	if !cfg.EnableRedownload {
+		t.Fatal("enable-redownload should be loaded from config")
 	}
 	if !reflect.DeepEqual(cfg.InputtedMimeType, []string{"image/png", "application/pdf"}) {
 		t.Fatalf("mime-type = %#v", cfg.InputtedMimeType)
@@ -514,8 +532,10 @@ func TestParseScanCommandConfigFromDefaultXDGPath(t *testing.T) {
 		"  json: true",
 		"transport:",
 		"  timeout: 30s",
+		"  roundtrip-timeout: 8s",
 		"scan:",
 		"  scan-mode: only-ip",
+		"  scan-concurrency: 4",
 		"  fronting-enable: true",
 		"  fronting-target: scan-a.example.com,scan-b.example.com",
 		"  scan-domain-list: domains.txt",
@@ -545,6 +565,9 @@ func TestParseScanCommandConfigFromDefaultXDGPath(t *testing.T) {
 	if options.ScanMode != scanModeOnlyIP {
 		t.Fatalf("scan-mode = %q, want %q", options.ScanMode, scanModeOnlyIP)
 	}
+	if options.ScanConcurrency != 4 {
+		t.Fatalf("scan-concurrency = %d, want 4", options.ScanConcurrency)
+	}
 	if options.ScanDomainList != "domains.txt" {
 		t.Fatalf("scan-domain-list = %q, want domains.txt", options.ScanDomainList)
 	}
@@ -557,6 +580,9 @@ func TestParseScanCommandConfigFromDefaultXDGPath(t *testing.T) {
 	}
 	if transport.Timeout != 30*time.Second {
 		t.Fatalf("timeout = %v, want 30s", transport.Timeout)
+	}
+	if transport.RoundTripTimeout != 8*time.Second {
+		t.Fatalf("roundtrip timeout = %v, want 8s", transport.RoundTripTimeout)
 	}
 	if !transport.Fronting.Enable {
 		t.Fatal("fronting should be enabled from config")
@@ -616,6 +642,7 @@ func TestParseGetCommandConfigNegativeFlagsOverrideConfig(t *testing.T) {
 		"  completion-report: true",
 		"  exit-report: true",
 		"  file-info: true",
+		"  enable-redownload: true",
 		"  no-top-directory: true",
 		"  skip-errors: true",
 	}, "\n") + "\n"
@@ -632,6 +659,7 @@ func TestParseGetCommandConfigNegativeFlagsOverrideConfig(t *testing.T) {
 		"--no-completion-report",
 		"--no-exit-report",
 		"--no-file-info",
+		"--no-enable-redownload",
 		"--create-top-directory",
 		"--no-skip-errors",
 		"--no-dump-request",
@@ -665,6 +693,9 @@ func TestParseGetCommandConfigNegativeFlagsOverrideConfig(t *testing.T) {
 	}
 	if cfg.ShowFileInf {
 		t.Fatal("file info mode should be disabled by --no-file-info")
+	}
+	if cfg.EnableRedownload {
+		t.Fatal("enable-redownload should be disabled by --no-enable-redownload")
 	}
 	if cfg.Notcreatetopdirectory {
 		t.Fatal("no-top-directory should be disabled by --create-top-directory")

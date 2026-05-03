@@ -31,6 +31,7 @@ type yamlTransportFileConfig struct {
 	ForceHTTP1        *bool   `yaml:"force-http1"`
 	PreferHTTP2       *bool   `yaml:"prefer-http2"`
 	Proxy             *string `yaml:"proxy"`
+	RoundTripTimeout  *string `yaml:"roundtrip-timeout"`
 	RequestDelay      *string `yaml:"request-delay"`
 	ResolveTo         *string `yaml:"resolve-to"`
 	RetryCount        *int    `yaml:"retry-count"`
@@ -48,6 +49,7 @@ type yamlGetFileConfig struct {
 	APIKey                  *string `yaml:"api-key"`
 	CompletionReport        *bool   `yaml:"completion-report"`
 	DryRun                  *bool   `yaml:"dry-run"`
+	EnableRedownload        *bool   `yaml:"enable-redownload"`
 	EnableProgress          *bool   `yaml:"progress"`
 	ExitReport              *bool   `yaml:"exit-report"`
 	Extension               *string `yaml:"extension"`
@@ -67,6 +69,7 @@ type yamlGetFileConfig struct {
 type yamlScanFileConfig struct {
 	yamlTransportFileConfig `yaml:",inline"`
 	JSONOutput              *bool   `yaml:"json"`
+	ScanConcurrency         *int    `yaml:"scan-concurrency"`
 	ScanMode                *string `yaml:"scan-mode"`
 }
 
@@ -77,6 +80,7 @@ type yamlTestFileConfig struct {
 
 type yamlMergeFileConfig struct {
 	DeleteChunks *bool   `yaml:"delete-chunks"`
+	DryRun       *bool   `yaml:"dry-run"`
 	ExitReport   *bool   `yaml:"exit-report"`
 	JSONOutput   *bool   `yaml:"json"`
 	Output       *string `yaml:"output"`
@@ -264,6 +268,8 @@ func assignYAMLCLIConfigValue(values *yamlCLIConfig, section, key, raw string, l
 			return assignBoolPointer(&values.Get.CompletionReport, raw, lineNumber, key)
 		case "dry-run":
 			return assignBoolPointer(&values.Get.DryRun, raw, lineNumber, key)
+		case "enable-redownload", "redownload":
+			return assignBoolPointer(&values.Get.EnableRedownload, raw, lineNumber, key)
 		case "progress":
 			return assignBoolPointer(&values.Get.EnableProgress, raw, lineNumber, key)
 		case "exit-report":
@@ -305,6 +311,8 @@ func assignYAMLCLIConfigValue(values *yamlCLIConfig, section, key, raw string, l
 		switch key {
 		case "json":
 			return assignBoolPointer(&values.Scan.JSONOutput, raw, lineNumber, key)
+		case "scan-concurrency":
+			return assignIntPointer(&values.Scan.ScanConcurrency, raw, lineNumber, key)
 		case "scan-mode":
 			values.Scan.ScanMode = stringPointer(raw)
 		default:
@@ -327,6 +335,8 @@ func assignYAMLCLIConfigValue(values *yamlCLIConfig, section, key, raw string, l
 		switch key {
 		case "delete-chunks":
 			return assignBoolPointer(&values.Merge.DeleteChunks, raw, lineNumber, key)
+		case "dry-run":
+			return assignBoolPointer(&values.Merge.DryRun, raw, lineNumber, key)
 		case "exit-report":
 			return assignBoolPointer(&values.Merge.ExitReport, raw, lineNumber, key)
 		case "json":
@@ -369,6 +379,8 @@ func assignTransportConfigValue(values *yamlTransportFileConfig, key, raw string
 		return assignBoolPointer(&values.PreferHTTP2, raw, lineNumber, key)
 	case "proxy":
 		values.Proxy = stringPointer(raw)
+	case "roundtrip-timeout":
+		values.RoundTripTimeout = stringPointer(raw)
 	case "request-delay":
 		values.RequestDelay = stringPointer(raw)
 	case "resolve-to":
@@ -507,6 +519,7 @@ func resolveJSONOutputOption(c *cli.Context, defaults *bool, command *bool) (boo
 func resolveTransportOptionFlags(c *cli.Context, shared yamlTransportFileConfig, command yamlTransportFileConfig) (transportOptionFlags, error) {
 	proxy, _ := resolveStringOption(c, "proxy", command.Proxy, shared.Proxy)
 	timeout, _ := resolveStringOption(c, "timeout", command.Timeout, shared.Timeout)
+	roundTripTimeout, _ := resolveStringOption(c, "roundtrip-timeout", command.RoundTripTimeout, shared.RoundTripTimeout)
 	requestDelay, _ := resolveStringOption(c, "request-delay", command.RequestDelay, shared.RequestDelay)
 	retryCount, _ := resolveIntOption(c, "retry-count", command.RetryCount, shared.RetryCount)
 	verbosity, _ := resolveIntOption(c, "verbosity", command.Verbosity, shared.Verbosity)
@@ -558,6 +571,7 @@ func resolveTransportOptionFlags(c *cli.Context, shared yamlTransportFileConfig,
 		ForceHTTP1:        forceHTTP1,
 		PreferHTTP2:       preferHTTP2,
 		Proxy:             proxy,
+		RoundTripTimeout:  roundTripTimeout,
 		RequestDelay:      requestDelay,
 		ResolveTo:         resolveTo,
 		RetryCount:        retryCount,
@@ -639,6 +653,10 @@ func buildTransportConfigFromOptions(options transportOptionFlags) (transportCon
 	if err != nil {
 		return transportConfig{}, err
 	}
+	roundTripTimeout, err := parseFlexibleDuration(options.RoundTripTimeout, "--roundtrip-timeout")
+	if err != nil {
+		return transportConfig{}, err
+	}
 	requestDelay, err := parseFlexibleDuration(options.RequestDelay, "--request-delay")
 	if err != nil {
 		return transportConfig{}, err
@@ -662,6 +680,7 @@ func buildTransportConfigFromOptions(options transportOptionFlags) (transportCon
 		ForceHTTP1:        forceHTTP1,
 		PreferHTTP2:       preferHTTP2,
 		Proxy:             proxyURL,
+		RoundTripTimeout:  roundTripTimeout,
 		RetryCount:        retryCount,
 		RequestDelay:      requestDelay,
 		ResolveTo:         resolveTo,
@@ -715,6 +734,10 @@ func parseGetCommandConfigWithEnv(c *cli.Context, env cliParseEnvironment) (*con
 	mimeTypes, _ := resolveStringSliceOption(c, "mime-type", loaded.Values.Get.MimeTypes)
 	resumableDownload, _ := resolveStringOption(c, "resumable-download", loaded.Values.Get.ResumableDownload)
 	dryRun, _, err := resolveBoolOptionWithNegative(c, "dry-run", "no-dry-run", loaded.Values.Get.DryRun)
+	if err != nil {
+		return nil, err
+	}
+	enableRedownload, _, err := resolveBoolOptionWithNegative(c, "enable-redownload", "no-enable-redownload", loaded.Values.Get.EnableRedownload)
 	if err != nil {
 		return nil, err
 	}
@@ -774,6 +797,7 @@ func parseGetCommandConfigWithEnv(c *cli.Context, env cliParseEnvironment) (*con
 		CompletionReport:      completionReport,
 		Disp:                  disp,
 		DryRun:                dryRun,
+		EnableRedownload:      enableRedownload,
 		EnableProgress:        enableProgress,
 		Ext:                   extension,
 		ExitReport:            exitReport,
@@ -806,6 +830,11 @@ func parseScanCommandOptionsWithEnv(c *cli.Context, env cliParseEnvironment) (sc
 		return scanCommandOptions{}, err
 	}
 	options.transportOptionFlags, err = resolveTransportOptionFlags(c, loaded.Values.Transport, loaded.Values.Scan.yamlTransportFileConfig)
+	if err != nil {
+		return scanCommandOptions{}, err
+	}
+	scanConcurrencyValue, _ := resolveIntOption(c, "scan-concurrency", loaded.Values.Scan.ScanConcurrency)
+	options.ScanConcurrency, err = parseScanConcurrency(scanConcurrencyValue)
 	if err != nil {
 		return scanCommandOptions{}, err
 	}
@@ -848,6 +877,10 @@ func parseMergeCommandOptionsWithEnv(c *cli.Context, env cliParseEnvironment) (m
 		return mergeCommandOptions{}, err
 	}
 	options.DeleteChunks, _, err = resolveBoolOptionWithNegative(c, "delete-chunks", "keep-chunks", loaded.Values.Merge.DeleteChunks)
+	if err != nil {
+		return mergeCommandOptions{}, err
+	}
+	options.DryRun, _, err = resolveBoolOptionWithNegative(c, "dry-run", "no-dry-run", loaded.Values.Merge.DryRun)
 	if err != nil {
 		return mergeCommandOptions{}, err
 	}

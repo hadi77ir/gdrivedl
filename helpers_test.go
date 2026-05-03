@@ -153,6 +153,34 @@ func TestMainHelperFunctions(t *testing.T) {
 		if snapshot.Status != taskCompleted || snapshot.Detail != "dry run" {
 			t.Fatalf("dry-run task snapshot = %#v", snapshot)
 		}
+
+		res = &http.Response{
+			Status:        "200 OK",
+			StatusCode:    http.StatusOK,
+			ContentLength: 5,
+			Header:        http.Header{"Content-Disposition": []string{"attachment; filename=\"report4.txt\""}, "Content-Type": []string{"text/plain"}},
+			Body:          io.NopCloser(strings.NewReader("world")),
+		}
+		path := filepath.Join(dir, "report4.txt")
+		if err := os.WriteFile(path, []byte("hello"), 0o666); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		task = &downloadTask{status: taskPending, updatedAt: time.Now()}
+		folderSave := &para{Disp: true, WorkDir: dir, Kind: "file", DlFolder: true, DownloadBytes: -1, Task: task}
+		if err := folderSave.saveFile(res); err != nil {
+			t.Fatalf("saveFile() folder skip error = %v", err)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile() error = %v", err)
+		}
+		if string(content) != "hello" {
+			t.Fatalf("existing folder file content = %q, want hello", string(content))
+		}
+		snapshot = task.snapshot()
+		if snapshot.Status != taskCompleted || snapshot.Detail != "already complete" || snapshot.Total != 5 || snapshot.Downloaded != 5 {
+			t.Fatalf("folder existing-file task snapshot = %#v", snapshot)
+		}
 	})
 
 	t.Run("detectGoogleLoginRequirement by request URL", func(t *testing.T) {
@@ -423,6 +451,9 @@ func TestFolderHelperFunctions(t *testing.T) {
 	newDir := filepath.Join(dir, "child")
 	if err := p.makeDirByCondition(newDir); err != nil {
 		t.Fatalf("makeDirByCondition() error = %v", err)
+	}
+	if err := p.makeDirByCondition(newDir); err != nil {
+		t.Fatalf("makeDirByCondition(existing dir) error = %v", err)
 	}
 	nestedDir := filepath.Join(dir, "parent", "child", "grandchild")
 	if err := p.makeDirByCondition(nestedDir); err != nil {

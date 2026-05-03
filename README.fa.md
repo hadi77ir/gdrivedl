@@ -125,9 +125,18 @@ gdrivedl get -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' --api
 gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' --api-key "$GDRIVEDL_APIKEY" --resumable-download 100m
 ```
 
-- فایل‌های کامل‌شده نگه داشته و رد می‌شوند.
+اجبار به دانلود دوبارهٔ فایل‌های کاملِ منطبق داخل یک پوشه:
+
+```bash
+gdrivedl get -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing' --enable-redownload
+```
+
+- پوشه‌های موجود در اجراهای بعدیِ دانلود پوشه به‌صورت خودکار دوباره استفاده می‌شوند.
+- اگر اندازهٔ فایل محلی با اندازهٔ موجود در listing پوشه یا اندازهٔ نهاییِ resolveشدهٔ فایل یکسان باشد، فایل‌های کامل‌شده به‌طور پیش‌فرض نگه داشته و رد می‌شوند.
+- برای دانلود دوبارهٔ فایل‌های کاملِ منطبق از `--enable-redownload` استفاده کنید.
 - فایل‌های ناقص، در صورت پشتیبانی از دانلود بازه‌ای، ازسرگرفته می‌شوند.
 - اگر فایلی قابل‌ازسرگیری نباشد، `gdrivedl` فایل ناقص را موقتاً حفظ می‌کند و همان فایل را از ابتدا دوباره دانلود می‌کند، بدون این‌که کل فرایند ازسرگیری پوشه شکست بخورد.
+- اگر حالت ازسرگیریِ پوشه فعال نباشد یا در دسترس نباشد، فایل‌های ناقصِ نامنطبق به‌جای آن دوباره از ابتدا دانلود می‌شوند.
 - با فشردن `Ctrl+C` کار جاری از طریق context مشترک لغو می‌شود، نزدیک‌ترین وضعیت امنِ جزئی روی دیسک حفظ می‌شود و بعداً می‌توانید با `-r` دوباره اجرا کنید تا از نزدیک‌ترین نقطهٔ ممکن ادامه پیدا کند.
 
 تست یک درخواست دانلود بدون نوشتن هیچ فایلی:
@@ -189,6 +198,12 @@ gdrivedl scan \
   --fronting-sni www.google.com
 ```
 
+اجرای اسکن با workerهای موازی و timeout جداگانه برای round trip هر probe:
+
+```bash
+gdrivedl scan --scan-concurrency 8 --roundtrip-timeout 8s
+```
+
 اضافه‌کردن دامنه‌های کاندید بیشتر از فایل یا ورودی استاندارد:
 
 ```bash
@@ -223,11 +238,13 @@ gdrivedl scan --save gdrivedl.yml
 
 اجرای اسکن با `Ctrl+C` قابل لغو است. `--verbosity 1` لاگ زندهٔ فازها را نشان می‌دهد، `--verbosity 2` جزئیات مرحله‌به‌مرحله را اضافه می‌کند، و `--json` هنگام اجرای اسکن رویدادهای ساختاریافتهٔ timestampدار از نوع `log` و `progress` را خروجی می‌دهد.
 
-`--scan-mode full` هر دو فاز را به‌صورت ترتیبی اجرا می‌کند. `--scan-mode only-ip` نتایج DNS، مقادیر پیکربندی‌شدهٔ `--resolve-to` و بازه‌های IP را اسکن می‌کند. `--scan-mode only-domains` از کشف DNS/IP صرف‌نظر می‌کند و targetهای fronting را به‌همراه هر hostname اضافی در `--fronting-sni` روی فهرست IPهای داده‌شده در `--resolve-to` probe می‌کند.
+`--scan-mode full` هر دو فاز را به‌صورت ترتیبی اجرا می‌کند. `--scan-mode only-ip` نتایج DNS، مقادیر پیکربندی‌شدهٔ `--resolve-to` و بازه‌های IP را اسکن می‌کند. `--scan-mode only-domains` IPهای صریح `--resolve-to` را می‌پذیرد، و وقتی `--fronting-target` داده شود اسکن را با IPهای به‌دست‌آمده از system DNS همان fronting targetها هم گسترده‌تر می‌کند؛ حتی اگر `--resolve-to` از قبل تنظیم شده باشد.
+
+`--scan-concurrency` تعداد workerهای موازی برای direct probe، resolve کردن DNS، dial check و fronting probe را کنترل می‌کند. `--roundtrip-timeout` برای هر round trip جداگانهٔ probe/request یک سقف زمانی می‌گذارد، بدون اینکه timeout کلی HTTP client را تغییر دهد.
 
 `--save` نتایج اسکن را دوباره در یک فایل پیکربندی YAML می‌نویسد. این گزینه بخش‌های نامرتبط مانند `defaults`، `get` و `merge` را حفظ می‌کند و در عین حال مقادیر قابل‌استفادهٔ مجدد در `transport` و `scan` مانند `fronting-target`، `fronting-sni`، `resolve-to` و `utls-profile` را به‌روزرسانی می‌کند.
 
-در صورت وجود، فهرست subdomainهای کاندید از `assets/google-subdomains.txt` بارگذاری می‌شود؛ در غیر این صورت از فهرست تعبیه‌شده استفاده می‌شود و می‌توان آن را با `--scan-domain-list` گسترش داد. همچنین IPها و بازه‌های CIDR مربوط به Google از `assets/google-ips.txt` بارگذاری می‌شوند و می‌توان آن‌ها را با `--scan-ip-list` گسترش داد.
+منابع پیش‌فرض اسکن به‌صورت تعبیه‌شده و بر پایهٔ `assets/known-domains.txt` و `assets/known-ip-ranges.txt` استفاده می‌شوند و می‌توانید آن‌ها را با `--scan-domain-list` و `--scan-ip-list` گسترش دهید. به‌صورت پیش‌فرض، اسکن از هر CIDR حداکثر `16` IP را نمونه‌برداری می‌کند؛ برای باز کردن کامل بازه‌ها از `--scan-ip-random-count 0` استفاده کنید.
 
 ## ادغام
 
@@ -261,10 +278,17 @@ gdrivedl merge -o merged.bin --delete-chunks ./download-parts
 gdrivedl merge -o merged.bin --unsafe ./download-parts
 ```
 
+پیش‌نمایش ترتیب ادغام بدون نوشتن فایل خروجی:
+
+```bash
+gdrivedl merge -o merged.bin --dry-run ./download-parts
+```
+
 نکات:
 
 - `gdrivedl merge` به‌طور پیش‌فرض از حالت امن استفاده می‌کند: ابتدا در یک خروجی موقت می‌نویسد، بعد از موفقیت آن را به جای فایل نهایی rename می‌کند و تا وقتی `--delete-chunks` تنظیم نشده باشد chunkها را نگه می‌دارد.
 - `gdrivedl merge --unsafe` رفتار قدیمیِ نوشتن مستقیم را برمی‌گرداند و هنگام ادغام chunkها را حذف می‌کند، اما در این حالت لغو عملیات پشتیبانی نمی‌شود.
+- `gdrivedl merge --dry-run` مسیر chunkها را دقیقاً با همان ترتیب صعودیِ الفبایی-عددی که ادغام واقعی استفاده می‌کند چاپ می‌کند و هیچ فایل خروجی‌ای نمی‌سازد و هیچ ورودی‌ای را حذف نمی‌کند.
 
 ## پیکربندی YAML
 
@@ -283,6 +307,7 @@ defaults:
 transport:
   proxy: http://127.0.0.1:2089
   timeout: 45s
+  roundtrip-timeout: 10s
   retry-count: 2
   verbosity: 1
 
@@ -291,12 +316,14 @@ get:
   concurrency: 4
   directory: /tmp/downloads
   api-key: your-api-key
+  enable-redownload: false
   fronting-enable: true
   fronting-target: google.com
   utls-profile: firefox_auto,chrome_auto
 
 scan:
   scan-mode: full
+  scan-concurrency: 8
   fronting-enable: true
   fronting-target: google.com
   scan-ip-random-count: 16
@@ -304,6 +331,7 @@ scan:
 merge:
   progress: true
   delete-chunks: false
+  dry-run: false
 ```
 
 فایل‌های پیکربندی عمداً ورودی‌های یک‌بارهٔ CLI مانند `url`، `url-list`، `help`، `version` یا آرگومان‌های ورودی `merge` را نمی‌پذیرند.

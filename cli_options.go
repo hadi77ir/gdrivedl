@@ -19,6 +19,7 @@ type transportOptionFlags struct {
 	ForceHTTP1        bool
 	PreferHTTP2       bool
 	Proxy             string
+	RoundTripTimeout  string
 	RequestDelay      string
 	ResolveTo         string
 	RetryCount        int
@@ -43,6 +44,7 @@ type downloadOptionFlags struct {
 	APIKey                string
 	Directory             string
 	DryRun                bool
+	EnableRedownload      bool
 	Extension             string
 	Filename              string
 	MimeTypes             []string
@@ -58,6 +60,7 @@ type downloadOptionFlags struct {
 
 type mergeOptionFlags struct {
 	DeleteChunks bool
+	DryRun       bool
 	ExitReport   bool
 	Inputs       []string
 	Output       string
@@ -79,8 +82,9 @@ type scanCommandOptions struct {
 	configPathOptionFlags
 	jsonOutputOptionFlags
 	transportOptionFlags
-	ScanMode scanMode
-	SavePath string
+	ScanConcurrency int
+	ScanMode        scanMode
+	SavePath        string
 }
 
 type testCommandOptions struct {
@@ -253,6 +257,14 @@ func downloadOverwriteCLIFlags() []cli.Flag {
 			Usage: "Skip existing files with the same name.",
 		},
 		&cli.BoolFlag{
+			Name:  "enable-redownload, redownload",
+			Usage: "When downloading folders, redownload files whose local size already matches the remote size instead of skipping them.",
+		},
+		&cli.BoolFlag{
+			Name:  "no-enable-redownload, no-redownload",
+			Usage: "Disable folder redownload mode even when it is enabled by config.",
+		},
+		&cli.BoolFlag{
 			Name:  "no-skip",
 			Usage: "Disable skip-existing mode even when it is enabled by config.",
 		},
@@ -272,6 +284,10 @@ func transportCLIFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "request-delay",
 			Usage: "Minimum delay between HTTP requests. Accepts Go duration strings like 500ms, 2s, or plain seconds like 1.",
+		},
+		&cli.StringFlag{
+			Name:  "roundtrip-timeout",
+			Usage: "Per-request round-trip timeout inside the shared transport. Accepts Go duration strings like 10s, 500ms, or plain seconds like 30.",
 		},
 		&cli.IntFlag{
 			Name:  "retry-count",
@@ -371,8 +387,13 @@ func scanCLIFlags() []cli.Flag {
 		},
 		&cli.IntFlag{
 			Name:  "scan-ip-random-count",
-			Usage: "When greater than 0, randomly select up to this many IPs from each CIDR entry used by scan instead of probing the full range. Explicit IP entries are still tested.",
-			Value: 0,
+			Usage: "When greater than 0, randomly select up to this many IPs from each CIDR entry used by scan instead of probing the full range. Explicit IP entries are still tested. Set 0 to expand ranges fully.",
+			Value: 16,
+		},
+		&cli.IntFlag{
+			Name:  "scan-concurrency",
+			Usage: "Maximum number of concurrent scan workers used for probing, DNS resolution, and dial checks.",
+			Value: 1,
 		},
 	}
 }
@@ -415,6 +436,14 @@ func mergeOutputCLIFlags() []cli.Flag {
 
 func mergeBehaviorCLIFlags() []cli.Flag {
 	return []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "dry-run",
+			Usage: "Print the chunk files in merge order without creating the output file or deleting any source files.",
+		},
+		&cli.BoolFlag{
+			Name:  "no-dry-run",
+			Usage: "Disable merge dry-run mode even when it is enabled by config.",
+		},
 		&cli.BoolFlag{
 			Name:  "unsafe",
 			Usage: "Use the old streaming merge mode that writes directly to the final output and deletes chunks as it goes. Cancellation is not supported in this mode.",

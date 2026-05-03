@@ -45,6 +45,7 @@ type config struct {
 	CompletionReport      bool
 	Disp                  bool
 	DryRun                bool
+	EnableRedownload      bool
 	EnableProgress        bool
 	Ext                   string
 	ExitReport            bool
@@ -74,6 +75,7 @@ type transportConfig struct {
 	ForceHTTP1          bool
 	PreferHTTP2         bool
 	Proxy               *url.URL
+	RoundTripTimeout    time.Duration
 	RetryCount          int
 	RequestDelay        time.Duration
 	ResolveTo           string
@@ -356,6 +358,7 @@ func (cfg *config) toPara() *para {
 		DlFolder:              false,
 		DownloadBytes:         -1,
 		DryRun:                cfg.DryRun,
+		EnableRedownload:      cfg.EnableRedownload,
 		EnableProgress:        cfg.EnableProgress,
 		Ext:                   cfg.Ext,
 		ExitReport:            cfg.ExitReport,
@@ -536,6 +539,16 @@ func parseRetryCount(value int) (int, error) {
 func parseScanIPRandomCount(value int) (int, error) {
 	if value < 0 {
 		return 0, fmt.Errorf("--scan-ip-random-count must be greater than or equal to 0")
+	}
+	return value, nil
+}
+
+func parseScanConcurrency(value int) (int, error) {
+	if value < 0 {
+		return 0, fmt.Errorf("--scan-concurrency must be greater than or equal to 0")
+	}
+	if value == 0 {
+		return 1, nil
 	}
 	return value, nil
 }
@@ -783,12 +796,19 @@ func (rt *smartRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		if err := rt.waitRequestDelay(attemptReq.Context(), attemptReq); err != nil {
 			return nil, err
 		}
+		cancel := func() {}
+		if rt.config.RoundTripTimeout > 0 {
+			attemptCtx, attemptCancel := context.WithTimeout(attemptReq.Context(), rt.config.RoundTripTimeout)
+			attemptReq = attemptReq.Clone(attemptCtx)
+			cancel = attemptCancel
+		}
 		var res *http.Response
 		if rt.config.Scan && attemptReq.URL.Scheme == "https" {
 			res, err = rt.roundTripScanned(attemptReq)
 		} else {
 			res, err = rt.roundTripOnce(attemptReq)
 		}
+		cancel()
 		if err == nil {
 			if attempt < attempts && shouldRetryHTTPStatus(res.StatusCode) {
 				rt.config.logDetail(attemptReq, 1, "retrying request attempt=%d/%d status=%s", attempt+1, attempts, res.Status)
